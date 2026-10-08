@@ -96,6 +96,15 @@ def embed_chunk(U, data, profile=LEGACY):
 
 
 def extract_chunk(U, profile=LEGACY):
+    return _extract_chunk(U, profile, with_confidence=False)
+
+
+def extract_chunk_with_confidence(U, profile=LEGACY):
+    """Return bytes and per-byte minimum quantizer margin (not probability)."""
+    return _extract_chunk(U, profile, with_confidence=True)
+
+
+def _extract_chunk(U, profile, *, with_confidence):
     profile = get_profile(profile)
     size = chunk_size(U.shape, profile)
     if not size:
@@ -105,12 +114,31 @@ def extract_chunk(U, profile=LEGACY):
     positions = get_positions(image.shape, size * 8, None if profile.stc == 'legacy' else profile.width)
     cols = image.shape[1] // BLOCK_SIZE
     carrier = []
+    margins = []
 
     for position in positions:
         r, c = divmod(int(position), cols)
         y, x = r * BLOCK_SIZE, c * BLOCK_SIZE
-        carrier.append(decode_bit(get_coefficient(image[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE]), profile.delta))
+        coefficient = get_coefficient(image[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE])
+        carrier.append(decode_bit(coefficient, profile.delta))
+        if with_confidence:
+            value = coefficient / profile.delta
+            margins.append(profile.delta * (0.5 - abs(value - np.rint(value))))
 
     carrier = np.asarray(carrier, dtype=np.uint8)
     bits = stc_decode(carrier) if profile.stc == 'legacy' else stc.extract(carrier, profile.width)
-    return np.packbits(bits).tobytes()
+    data = np.packbits(bits).tobytes()
+    if not with_confidence:
+        return data
+    margins = np.asarray(margins)
+    if profile.stc == 'legacy':
+        confidence = np.array([margins[3*i:3*i+5].min() for i in range(len(bits))])
+    else:
+        confidence = np.full(len(bits), np.inf)
+        for column, mask in enumerate(stc.columns(profile.width)):
+            for offset in range(min(stc.HEIGHT, len(bits))):
+                if (mask >> offset) & 1:
+                    confidence[offset:] = np.minimum(
+                        confidence[offset:],
+                        margins[column::profile.width][:len(bits)-offset])
+    return data, confidence.reshape(-1, 8).min(axis=1)

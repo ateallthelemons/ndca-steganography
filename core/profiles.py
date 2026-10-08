@@ -1,4 +1,4 @@
-"""Immutable NDV4 body profiles. IDs are wire-format constants, never reassigned."""
+"""Immutable embedding profiles. IDs are wire-format constants, never reassigned."""
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -12,6 +12,7 @@ class Profile:
     delta: int
     cost: str
     height: int
+    version: str = 'NDV4'
 
 
 LEGACY = Profile(1, 'legacy', 'legacy', 3, 40, 'crf', 2)
@@ -23,7 +24,13 @@ for width in (2, 3):
             ident = len(_profiles) + 1
             _profiles[ident] = Profile(ident, f'stc3-r{width}-d{delta}-{cost}',
                                        'matrix', width, delta, cost, 3)
+ROBUST80 = Profile(14, 'experimental-robust80', 'matrix', 2, 80, 'crf', 3, 'NDV5')
+_profiles[ROBUST80.id] = ROBUST80
 PROFILES = MappingProxyType(_profiles)
+
+
+def bootstrap_copies(profile=LEGACY):
+    return 3 if get_profile(profile).version == 'NDV5' else 1
 
 
 def get_profile(value=LEGACY):
@@ -53,6 +60,8 @@ def select_profile(profile=None, stc=None, rate=None, delta=None, cost=None):
     delta = 40 if delta is None else delta
     cost = cost or 'crf'
     for candidate in PROFILES.values():
+        if candidate.version != 'NDV4':
+            continue  # Experimental wire formats must be selected by name.
         if (candidate.stc, f'1/{candidate.width}', candidate.delta, candidate.cost) == (stc, rate, delta, cost):
             return candidate
     raise ValueError('Unsupported coding settings; legacy requires rate 1/3, delta 40, CRF costs')

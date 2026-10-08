@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from core.framing import MessageReader
+from core.frame_reader import FrameReader
 from core.profiles import get_profile
 from core.progress import Progress
 from core.video_io import video_frames
@@ -9,7 +9,7 @@ from core.video_io import video_frames
 
 def recover(filename, *, progress=False):
     """Extract, repair, and validate a file without writing to the filesystem."""
-    reader = MessageReader()
+    reader = FrameReader()
     status = Progress('Decoding', enabled=progress)
     frames = 0
     for frames, (_, U, _) in enumerate(video_frames(filename), start=1):
@@ -18,7 +18,7 @@ def recover(filename, *, progress=False):
                       final=result is not None)
         if result is not None:
             return result
-    result = reader.feed(b'', final=True)
+    result = reader.finish()
     status.update(frames, f'{len(reader.received)} encoded bytes read', final=True)
     return result
 
@@ -35,11 +35,17 @@ def decode(filename, output=None, *, progress=True):
     with destination.open('xb' if restore_name else 'wb') as target:
         target.write(result.payload)
     print(f'Recovered {len(result.payload)} bytes into {destination} ({result.version})')
-    if result.version == 'NDV4':
+    if result.version in ('NDV4', 'NDV5'):
         print(f'Embedding profile: {get_profile(result.profile_id).name}')
         print(f'Corrected bytes: bootstrap {result.header_corrections}, '
               f'body {sum(result.body_corrections)} '
               f'(maximum {max(result.body_corrections, default=0)} per codeword)')
+        if result.version == 'NDV5':
+            print(f'Recoverable header copies: {result.header_copies_recovered}/3')
+        if any(result.body_erasures):
+            print(f'Confidence-guided erasure repair: '
+                  f'{sum(n > 0 for n in result.body_erasures)} body codewords; '
+                  f'{sum(result.body_erasures)} byte positions marked unreliable')
 
 
 if __name__ == '__main__':

@@ -63,6 +63,10 @@ Re-extract the final pixels and require exact saved-FFV1 bytes before any RS rep
 
 ## Settings and capacity
 
+The named `experimental-robust80` profile adds delta 80 with rate 1/2 and CRF
+costs, including stronger bootstrap embedding and three protected header copies.
+It uses [NDV5](NDV5.md) and is opt-in. The NDV4 settings below remain unchanged.
+
 Profiles expose rates 1/2 and 1/3, delta 30/40/50, and CRF/CQP costs. The profile
 ID fixes the matrix, rate, quantization, and cost model. Unsupported combinations
 are rejected. The bootstrap remains legacy delta 40 and consumes separate whole
@@ -76,6 +80,13 @@ and padding. Exact capacity uses frame allocation, whole-byte rounding, protecte
 metadata, filename bytes, CRC, RS parity, and both kinds of padding.
 
 ## Integrated validation
+
+The production receiver retains quantizer-boundary margins through the STC
+mapping and byte deinterleaving. Failed body RS words get bounded erasure retries;
+conflicting candidates are rejected, and whole-file CRC/padding validation remains
+required. This decoder-only change consumes no carrier or parity capacity. See
+[NDV4 receiver details](NDV4.md). The focused regression suite is
+`python -m unittest discover -s tests -p test_decoder_confidence.py -v`.
 
 Run `python -m unittest discover -s tests -v`. Tests cover cost formulas, flat and
 boundary cases, all registered profiles through pixel reconstruction and saved

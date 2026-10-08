@@ -6,7 +6,7 @@ import av
 from core.ecc import HEADER_SIZE
 from core.framing import filename_bytes, maximum_payload, MAX_PAYLOAD_BYTES, require_embedding_profile
 from core.video_stego import chunk_size
-from core.profiles import LEGACY, add_profile_arguments, profile_from_args
+from core.profiles import LEGACY, add_profile_arguments, profile_from_args, bootstrap_copies
 from core.layout import message_capacity, bootstrap_frames
 
 
@@ -27,7 +27,7 @@ def capacity(input_name, profile=LEGACY):
             if dimensions is None:
                 dimensions = current_dimensions
                 bytes_per_frame = chunk_size((frame.height // 2, frame.width // 2), profile)
-                bootstrap_frames((frame.height // 2, frame.width // 2))
+                bootstrap_frames((frame.height // 2, frame.width // 2), profile)
                 if not bytes_per_frame:
                     raise ValueError('Video too small: no available U-plane payload capacity')
             elif current_dimensions != dimensions:
@@ -58,14 +58,15 @@ def main():
         parser.exit(1, f'Error: {error}\n')
 
     total = message_capacity((height // 2, width // 2), frames, profile)
-    maximum = maximum_payload(total, name_size)
+    maximum = maximum_payload(total, name_size, profile)
     print(f'Video: {width}x{height}, {frames:,} frames')
     print(f'Embedding profile: {profile.name}')
     print(f'Body capacity per frame before RS: {per_frame:,} bytes')
     if profile != LEGACY:
-        print(f'Reserved bootstrap frames: {bootstrap_frames((height // 2, width // 2))}')
+        print(f'Reserved bootstrap frames: {bootstrap_frames((height // 2, width // 2), profile)}')
     print(f'Framed message capacity (excludes bootstrap-frame padding): {total:,} bytes')
-    print(f'NDV4: {HEADER_SIZE}-byte protected bootstrap; RS(60,20) body, including filename and CRC32')
+    print(f'{profile.version}: {bootstrap_copies(profile)} x {HEADER_SIZE}-byte protected bootstrap; '
+          'RS(60,20) body, including filename and CRC32')
     print(f'Payload implementation limit: {MAX_PAYLOAD_BYTES:,} bytes')
     if maximum < 0:
         print('No file fits: insufficient room for the header and filename, even with an empty payload.')

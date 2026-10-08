@@ -21,7 +21,8 @@ On Windows, activate with `.venv\Scripts\activate` instead. The main runtime lib
 ```text
 core/
     ecc.py              # Fixed Reed–Solomon codes and byte interleaving
-    framing.py          # NDV4 framing, integrity, capacity, and legacy parsing
+    framing.py          # NDV4/NDV5 framing, integrity, capacity, and legacy parsing
+    frame_reader.py     # Automatic bootstrap format detection
     profiles.py         # Immutable coding profiles and CLI settings
     layout.py           # Bootstrap/body frame allocation and exact capacity
     stc.py              # Height-three matrix STC encoder and extractor
@@ -93,6 +94,23 @@ settings. Supplying individual settings selects matrix STC unless `--stc legacy`
 is explicit. Decoding reads the profile from the protected header automatically.
 Cost selection describes the anticipated channel; output remains FFV1.
 
+For a stronger experimental compression candidate, explicitly select:
+
+```bash
+python video_capacity.py materials/input.mp4 --filename message.txt --profile experimental-robust80
+python video_encode.py materials/input.mp4 materials/message.txt materials/encoded-robust80.mkv --profile experimental-robust80
+```
+
+`experimental-robust80` uses matrix STC at rate 1/2, delta 80, and CRF costs for
+both the header and body. It writes NDV5 with three independently protected
+header copies, each in its own group of whole frames. This allows larger pixel
+changes and adds header overhead. Recovery after YouTube or other lossy
+transcoding has succeeded for one tested YouTube H.264 rendition with the
+confidence-guided decoder; the AV1 rendition still fails. This is not yet a
+general reliability result. Select it by name; the ordinary
+`--delta` options and default profile are unchanged. Decoding detects it without
+extra flags. See [NDV5 format](docs/NDV5.md).
+
 ### Decode
 
 Choose an explicit destination:
@@ -119,9 +137,15 @@ omitting the output creates `./message.txt`. Both restore the stored filename an
 refuse to overwrite an existing file. An explicit output file path replaces an
 existing file at that path. Output directories must already exist.
 
-New encodes use NDV4. The decoder repairs its bootstrap before interpreting any
+Ordinary profiles use NDV4; `experimental-robust80` uses NDV5. The decoder repairs the bootstrap before interpreting any
 metadata, then repairs and checks the filename and payload before writing.
-It reports corrected byte counts for the bootstrap and body. Older NDV2/NDV3
+It reports corrected byte counts for the bootstrap and body; NDV5 also reports
+how many of its three header copies were recoverable. When ordinary body RS
+decoding fails, the decoder automatically retries with low-confidence bytes
+marked as erasures and reports how many codewords needed this fallback. It uses
+only the received pixels, requires all successful trials for a word to agree,
+and still validates the complete file before writing. This adds no embedded
+redundancy and works with existing NDV4/NDV5 videos. Older NDV2/NDV3
 videos remain supported without error correction; NDV2 requires an explicit output
 path because it has no stored filename. Files are currently limited to 256 MiB
 of payload, including legacy recovery, because this implementation buffers data.
@@ -129,6 +153,8 @@ of payload, including legacy recovery, because this implementation buffers data.
 ## How it works
 
 Before pixel embedding, the encoder protects a fixed bootstrap with RS(96,32).
+NDV5 embeds three copies of this protected bootstrap with its stronger mapping;
+it requires at least one valid copy and rejects conflicting valid copies.
 It protects `filename + payload + CRC32` with RS(60,20), interleaving groups of
 up to eight codewords to spread bursts of adjacent byte errors.
 
@@ -166,13 +192,17 @@ required_bytes = 96 + 60 × ceil((filename_utf8_bytes + file_bytes + 4) / 20)
 maximum_file_bytes = 20 × floor((raw_capacity - 96) / 60) - filename_utf8_bytes - 4
 ```
 
-For matrix STC at rate `1/w`, body capacity is `floor((B - 1) / (8*w))` bytes per
+For NDV4 matrix STC at rate `1/w`, body capacity is `floor((B - 1) / (8*w))` bytes per
 frame. Reserve `H = ceil(96 / legacy_bytes_per_frame)` complete bootstrap frames.
 When `frames >= H`, use `raw_capacity = 96 + (frames - H) × body_bytes_per_frame`
 in the formula above. This excludes unused bootstrap-frame slots and accounts for
 RS overhead and codeword padding. Fewer than H frames cannot carry a new-profile
 file. STC rate counts ECC-encoded bits per carrier; payload utilization is a
 separate setting, and the net file rate is lower after RS and metadata.
+
+For NDV5, reserve `3 × ceil(96 / body_bytes_per_frame)` bootstrap frames and
+288 logical header bytes. Each copy's spare frame slots are discarded. The capacity
+CLI includes these copies and all padding; see [the NDV5 formula](docs/NDV5.md).
 
 The capacity CLI handles videos too small for the bootstrap and caps the result
 at the 256 MiB implementation limit. The filename and header are stored once per
@@ -202,7 +232,11 @@ only its actual codewords, with no extra group padding.
 
 Both codes use GF(256), primitive polynomial `0x11d`, generator 2, and first
 consecutive root 0. Correction limits are per-codeword byte counts, not bit counts.
-Beyond those limits RS may fail or miscorrect; CRC checks remain mandatory.
+For failed body words, the decoder can also try 1–32 erasures ranked by received
+coefficient confidence. The mixed budget is `2 * unknown_errors + erasures <= 40`;
+unknown errors count only outside the erased positions. Low-confidence rankings
+are heuristic, so this does not guarantee recovery beyond 20 wrong bytes.
+Beyond the applicable limits RS may fail or miscorrect; CRC checks remain mandatory.
 CRC32 is an accidental-corruption check, not authentication. See
 [the NDV4 wire format](docs/NDV4.md) for exact layouts and decoding rules.
 
@@ -217,8 +251,9 @@ has no filename. New encoding does not emit these formats.
   recovery by changing carrier alignment.
 - Nominal capacity does not guarantee successful embedding. The encoder rejects
   chunks that cannot be recovered within its bounded pixel and coefficient changes.
-- Error correction has finite limits: up to 32 erroneous bootstrap bytes and
-  20 erroneous bytes per body codeword. Legacy NDV2/NDV3 headers are unprotected.
+- Error correction has finite limits: up to 32 erroneous bytes per bootstrap copy and
+  20 unknown erroneous bytes per body codeword. Confidence-guided body erasures
+  can recover some additional cases, but may fail or be ambiguous. Legacy NDV2/NDV3 headers are unprotected.
 - Inputs need even dimensions, usable timestamps, and sufficient U-plane capacity.
   Midstream resolution changes are unsupported.
 - FFV1 output can be large. Conversion to 8-bit YUV420p changes the source pixel

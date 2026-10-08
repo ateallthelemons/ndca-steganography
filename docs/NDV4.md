@@ -65,10 +65,24 @@ Encoding is systematic: data bytes precede parity bytes before interleaving.
 - Bootstrap: `RSCodec(64, nsize=96, ...)`, exactly 32 data + 64 parity bytes.
 - ECC profile 1 body: `RSCodec(40, nsize=60, ...)`, exactly 20 data + 40 parity bytes.
 
-Decoding uses unknown-error correction, without supplied erasure positions.
+Bootstrap decoding uses unknown-error correction. Body decoding tries ordinary
+correction first, then retries failed words using received-pixel confidence when
+available. The byte-only `MessageReader.feed()` API retains ordinary correction
+unless confidence is explicitly supplied.
 The guaranteed correction limits are 32 and 20 erroneous bytes respectively per
-codeword, including errors in parity. Beyond these limits decoding may fail or
+codeword for unknown errors, including errors in parity. Beyond these limits decoding may fail or
 miscorrect. CRC checks are therefore mandatory after correction.
+
+For body retries, the receiver measures each coefficient's distance to the nearest
+quantization boundary, takes the minimum over the carriers supporting each STC
+message bit, then the minimum over eight bits per byte. Confidence follows the
+same frame-padding removal and deinterleaving as data. Each failed word gets at
+most 32 additional RS trials, erasing its 1–32 least-confident bytes in stable
+wire-derived order. All successful trials must yield identical data; otherwise
+the word is rejected as ambiguous. A word with no successful trial is rejected.
+The mixed correction condition is `2e + s <= 40`, with e the unknown errors
+outside s erased positions. This receiver heuristic changes no wire bytes, rates,
+profile IDs, or bootstrap behavior. Whole-file integrity checks remain mandatory.
 
 ## Bootstrap
 
@@ -159,7 +173,10 @@ within the correction limit. Legacy formats have no ECC.
 
 The decoder reports corrected byte counts for the bootstrap, total body, and
 maximum per body codeword. Internally `Recovery.body_corrections` stores every
-codeword's count. Truncation, unsupported profiles, uncorrectable blocks, invalid
+codeword's count of actually changed bytes (excluding correct erased bytes).
+`Recovery.body_erasures` stores the first successful erasure count for each word,
+or zero when ordinary correction succeeded. The CLI reports fallback usage.
+Truncation, unsupported profiles, uncorrectable blocks, invalid
 metadata, and failed checksums cause an exception before output is written.
 Interleaving addresses adjacent-byte bursts, not alignment loss from frame drops,
 resizing, cropping, or reordered frames.
