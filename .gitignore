@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+research/
+materials/
+.DS_Store
+
