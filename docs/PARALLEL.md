@@ -1,10 +1,19 @@
-# Multi-core frame processing
+# Multi-core and batched frame processing
 
 Encoding, saved-video verification, and decoding used to handle one frame at a
-time on one CPU core. Each frame's work is independent of every other frame, so
-the tools now spread frames across all available cores. The embedding maths,
-coding profiles, and on-disk format are unchanged. A video encoded with any
-number of workers has identical pixels and decodes with any version.
+time on one CPU core, and within each frame one 16×16 block at a time. Two
+independent changes speed this up:
+
+1. **Multi-core:** frames are independent of each other, so the tools spread
+   them across all available cores (`core/parallel.py`).
+2. **Batched maths:** within a frame, the per-block wavelet and SVD work is done
+   for all blocks in a few NumPy calls, not thousands of small ones
+   (`core/ndca.py`, `core/video_stego.py`). See
+   [Batched per-frame maths](#batched-per-frame-maths).
+
+The embedding maths, coding profiles, and on-disk format are unchanged. Output
+pixels are bit-identical to the original code for any number of workers, and
+videos made before these changes decode as before.
 
 Tracked in issue #1, branch `1-parallelisation`.
 
@@ -219,17 +228,148 @@ The speed-up grows with video length and resolution, since there are more frames
 to keep every core busy. On short clips, starting the worker processes takes a
 noticeable share of the time.
 
+## Batched per-frame maths
+
+### Where the time went
+
+Profiling one 1080p frame (`stc3-r2-d40-crf`) showed that the old code spent
+almost all its time on Python overhead, not arithmetic:
+
+- `calculate_costs` looped over all ~2,000 blocks, calling `pywt.dwt2` and
+  `np.linalg.svd` on each.
+- `reconstruct_carrier` ran for each carrier and each bit value. It tried up to
+  four targets, and every attempt did a DWT, SVD, inverse DWT, rounding, and a
+  second DWT and SVD: about 12,000 small library calls per frame.
+- `extract_chunk` looped over the carriers with one DWT and SVD each.
+
+Each block is only 16×16 (an 8×8 LL band), so the fixed cost of each call
+outweighed the work it did.
+
+### Bit-exactness requirement
+
+A bit is read as `rint(S[0] / delta) % 2`. If a rewrite changed `S[0]` by even
+one floating-point rounding step, a coefficient sitting on a rounding boundary
+could read the other way, and videos encoded by the old code might stop decoding.
+So the batched code reproduces the original arithmetic **exactly**, not just
+approximately:
+
+- **Haar transform.** For Haar, `pywt` computes `even*s + odd*s` (low band) and
+  `even*s - odd*s` (high band) with `s = sqrt(0.5)`, along the rows first and
+  then the columns. The inverse reverses this, columns first. The batched
+  functions do the same operations in the same order on whole stacks of blocks.
+- **SVD and matrix product.** `np.linalg.svd` on a stack of matrices runs the
+  same LAPACK routine on each one, and a stacked `@` gives the same result as one
+  2-D product per block. Both were checked to be bit-identical to the per-block
+  calls.
+
+### New helpers in `core/ndca.py`
+
+They work on arrays of shape `(..., 16, 16)` and match the single-block
+functions, which are kept as the reference:
+
+| Batched helper | Matches |
+|---|---|
+| `image_blocks(image)` | view of the plane as a `(rows, cols, 16, 16)` grid |
+| `haar_dwt2(blocks)` | `pywt.dwt2(block, 'haar')` |
+| `haar_idwt2(LL, details)` | `pywt.idwt2((LL, details), 'haar')` |
+| `get_coefficients(blocks)` | `get_coefficient(block)` |
+| `decode_bits(values, delta)` | `decode_bit(value, delta)` |
+
+`calculate_costs` now computes all block coefficients in one call. It also
+computes the neighbour differences with array slices, comparing each block with
+the one above (`blocks[1:] - blocks[:-1]`) and the one to its left:
+
+```python
+blocks = image_blocks(image)
+coefficients = get_coefficients(blocks)
+
+upper = np.mean(np.abs(blocks[1:] - blocks[:-1]), axis=(2, 3))
+left = np.mean(np.abs(blocks[:, 1:] - blocks[:, :-1]), axis=(2, 3))
+differences = np.full((rows, cols), np.nan)
+differences[1:, 0] = upper[:, 0]
+differences[0, 1:] = left[0, :]
+differences[1:, 1:] = (upper[:, 1:] + left[1:, :]) / 2
+```
+
+The top-left block has no neighbours and stays `NaN`, as before.
+
+### `reconstruct_carriers` in `core/video_stego.py`
+
+This replaces the per-carrier loop over `reconstruct_carrier` (the single-block
+function stays as the reference). The sequential version, for one carrier and
+one bit:
+
+1. lists the targets `i * delta` within `±2·delta` of the coefficient whose
+   index `i` has the right parity,
+2. sorts them by distance, ties going to the smaller target,
+3. returns the first target whose rebuilt, rounded pixels change by at most
+   `delta` and still decode to the bit.
+
+The batched version tries **every** target for **every** carrier at once, then
+picks the same one:
+
+- At most five target indices fit in the `±2·delta` window, so each carrier gets
+  five slots `low, low+1, …, low+4`. Slots past `high` are masked off.
+- One SVD per carrier gives `U, S, Vt`. `S[0]` is replaced by each slot's target,
+  giving an `(n, 5, 8, 8)` stack of new LL bands. One inverse Haar call then
+  rebuilds all `n × 5` candidate blocks.
+- Each candidate is marked usable if it is in range, changes no pixel by more
+  than `delta`, and decodes to its own parity.
+- For each bit, `argmin` over the distance of the usable candidates of that
+  parity picks the winner. Slots are in ascending target order and `argmin`
+  returns the first minimum, so ties go to the smaller target, as before.
+
+It returns the chosen pixels, the movement, and a `found` mask for both bits of
+every carrier. `embed_chunk` builds the trellis costs from these in one step, and
+carriers with no usable candidate get `+inf`, as before:
+
+```python
+keep = np.arange(2) == cover[:, None]
+costs = np.where(keep, movement * factors[:, None], movement / factors[:, None])
+costs[~found] = np.inf
+```
+
+The chosen blocks are written back with explicit pixel indices, not through
+`image_blocks(result)`. That reshape is a copy, not a view, when the plane size
+is not a multiple of 16, and writes into a copy would be lost.
+
+`extract_chunk` now gathers the carrier blocks and decodes them in one call:
+
+```python
+blocks = image_blocks(image).reshape(-1, BLOCK_SIZE, BLOCK_SIZE)[positions]
+carrier = decode_bits(get_coefficients(blocks), profile.delta)
+```
+
+The trellis (`stc.embed`, `stc_encode`) is unchanged. Each step depends on the
+previous one, so it cannot be batched the same way. It takes about 0.03 s per
+frame, so it is not worth optimising yet.
+
+### Validation
+
+- Old and new `calculate_costs` on 10 frames of a 1080p video, both cost models:
+  identical (`NaN` compared as equal).
+- Old and new `embed_chunk`/`extract_chunk` on 5 frames (one cropped to 263×475,
+  not a multiple of 16) × all 13 profiles: identical output pixels, trellis
+  costs and extracted bytes.
+- Full encode of a 1080p, 1,437-frame video with an EPUB payload, on 1 and on 32
+  workers: every frame's pixels identical to the original code's output. All
+  decodes recover the payload byte-exact, including decoding a video encoded by
+  the original code.
+- Per 1080p frame, embedding went from 1.62 s to 0.25 s and extraction from
+  0.11 s to 0.02 s.
+
 ## Limits and possible next steps
 
-- **Video I/O is still single-threaded.** Reading the input and FFV1 encoding run
-  in the main process. On a machine with many cores this may become the
-  bottleneck.
+- **Video I/O is now the bottleneck on many cores.** Reading the input and FFV1
+  encoding run in the main process alone. With batched maths, each frame is fast
+  enough that workers spend time waiting for it. Encoding several frames ahead,
+  or letting FFmpeg use threads for decoding and FFV1 encoding, may help.
 - **Bootstrap frames are decoded in order.** These are only the first few frames,
   so the cost is small.
-- **Per-frame work is still slow Python.** Each worker still loops over blocks one
-  at a time (`calculate_costs`, `reconstruct_carrier`, `extract_chunk`). Batching
-  these with NumPy would speed up every worker, and the gain multiplies with the
-  multi-core speed-up.
+- **The remaining per-frame time is mostly SVD itself.** Further gains would need
+  a cheaper way to get `S[0]` (e.g. from the eigenvalues of `LLᵀLL`), but that
+  changes the floating-point results and would have to be proven never to flip
+  a decoded bit.
 - **GPU.** Not needed for now. GPU floating-point results can differ slightly
   from the CPU's, which could flip bits whose coefficient sits on a rounding
   boundary, so extraction should stay on the CPU.
