@@ -4,4 +4,6 @@ __pycache__/
 research/
 materials/
 .DS_Store
-
+tests/
+benchmark-runs/
+benchmarks/

@@ -1,8 +1,8 @@
 # NDCA Steganography
 
-A personal, experimental implementation inspired by **Neighboring block Differences-based Cost Assignment (NDCA)** for video steganography. It hides a file in a video's U chroma plane and recovers its bytes and original filename.
+A file-hiding tool inspired by **Neighboring block Differences-based Cost Assignment (NDCA)** for video steganography. It hides a file in a video's U chroma plane and recovers its bytes and original filename.
 
-The long-term goal is recovery after lossy compression, including social-network transcoding. The current implementation writes lossless FFV1 video in an MKV container; reliable recovery after lossy transcoding is not yet established.
+The encoder writes lossless FFV1 video in an MKV container and verifies recovery before saving the result. Recovery after lossy transcoding is not guaranteed.
 
 ## Setup
 
@@ -14,12 +14,17 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-On Windows, activate with `.venv\Scripts\activate` instead. The main runtime libraries are PyAV for video I/O, NumPy for arrays and SVD, and PyWavelets for wavelet transforms.
+On Windows, activate with `.venv\Scripts\activate` instead. The main runtime libraries are PyAV for video I/O, NumPy for arrays and SVD, PyWavelets for wavelet transforms, and `reedsolo` for error correction.
 
 ## Project structure
 
 ```text
 core/
+    ecc.py              # Fixed Reed–Solomon codes and byte interleaving
+    framing.py          # NDV4 framing, integrity, capacity, and legacy parsing
+    profiles.py         # Immutable coding profiles and CLI settings
+    layout.py           # Bootstrap/body frame allocation and exact capacity
+    stc.py              # Height-three matrix STC encoder and extractor
     ndca.py             # Wavelet/SVD embedding, costs, and trellis coding
     video_io.py         # YUV planes, video frames, and timestamps
     video_stego.py      # Per-frame capacity, embedding, and extraction
@@ -36,6 +41,10 @@ Run the commands below from the project root. The internal modules live in `core
 
 Create `materials/` if needed and place your own input video and payload there; these files are not included in the repository.
 
+Encoding, saved-video verification, and decoding print progress to stderr roughly
+every five seconds as frames finish, showing frame counts, byte progress, and
+elapsed time. Each stage also reports when it starts and completes.
+
 ### Check capacity
 
 Check how large a file a video can carry with the current embedding settings:
@@ -45,8 +54,9 @@ python video_capacity.py materials/input.mp4
 python video_capacity.py materials/input.mp4 --filename message.txt
 ```
 
-This scans all video frames for an accurate count and subtracts header and filename
-overhead. Without `--filename`, it reports the upper bound for a one-byte filename;
+This scans all video frames and accounts for the protected bootstrap, filename,
+checksum, Reed–Solomon parity, and codeword padding. Without `--filename`, it
+reports the upper bound for a one-byte filename;
 with it, the limit is exact for that basename (the payload file need not exist).
 This measures storage capacity, not resilience to lossy transcoding.
 
@@ -60,7 +70,28 @@ python video_encode.py materials/input.mp4 materials/message.txt materials/encod
 
 Use an `.mkv` output filename. The encoder uses FFV1; changing the extension to `.mp4` does not switch codecs. It processes the first video stream and copies audio streams without re-encoding them, subject to output-container compatibility.
 
-Choose a new output path, distinct from the input video and payload. The encoder opens the output for writing and removes it if encoding fails.
+Choose an output path distinct from the input video and payload; aliases, including
+symlinks and hard links, are rejected. The encoder writes a temporary MKV beside
+the destination, closes it, and verifies recovery before moving it into place.
+An existing destination is replaced only on success and is preserved on failure.
+Verification adds a full decoding pass over the output video.
+
+The default `legacy` profile preserves the original four-state trellis, delta 40,
+and CRF costs. To use the validated height-three matrix STC with configurable
+body settings:
+
+```bash
+python video_encode.py materials/input.mp4 materials/message.txt materials/encoded.mkv --stc matrix --rate 1/2 --delta 40 --cost crf
+python video_capacity.py materials/input.mp4 --filename message.txt --stc matrix --rate 1/2 --delta 40 --cost crf
+```
+
+Supported matrix STC rates are `1/2` and `1/3`, quantization steps are `30`, `40`,
+and `50`, and cost models are `crf` and `cqp`. Use the same settings for capacity
+and encoding. Alternatively select a named profile, such as
+`--profile stc3-r2-d40-cqp`; named profiles cannot be combined with individual
+settings. Supplying individual settings selects matrix STC unless `--stc legacy`
+is explicit. Decoding reads the profile from the protected header automatically.
+Cost selection describes the anticipated channel; output remains FFV1.
 
 ### Decode
 
@@ -70,38 +101,84 @@ Choose an explicit destination:
 python video_decode.py materials/encoded.mkv materials/recovered.txt
 ```
 
+To restore the original filename inside an existing directory:
+
+```bash
+mkdir -p materials/decoded
+python video_decode.py materials/encoded.mkv materials/decoded
+```
+
 Or omit the output argument to restore the original filename in the current directory:
 
 ```bash
 python video_decode.py materials/encoded.mkv
 ```
 
-For the example above, this creates `./message.txt`. Automatic restoration refuses to overwrite an existing file. An explicit output path replaces an existing file at that path. Output directories must already exist.
+For the example above, the directory form creates `materials/decoded/message.txt`;
+omitting the output creates `./message.txt`. Both restore the stored filename and
+refuse to overwrite an existing file. An explicit output file path replaces an
+existing file at that path. Output directories must already exist.
 
-The decoder verifies the payload's CRC32 before writing it. Older NDV2 videos remain supported but require an explicit output path because their headers do not contain a filename.
+New encodes use NDV4. The decoder repairs its bootstrap before interpreting any
+metadata, then repairs and checks the filename and payload before writing.
+It reports corrected byte counts for the bootstrap and body. Older NDV2/NDV3
+videos remain supported without error correction; NDV2 requires an explicit output
+path because it has no stored filename. Files are currently limited to 256 MiB
+of payload, including legacy recovery, because this implementation buffers data.
 
 ## How it works
+
+Before pixel embedding, the encoder protects a fixed bootstrap with RS(96,32).
+It protects `filename + payload + CRC32` with RS(60,20), interleaving groups of
+up to eight codewords to spread bursts of adjacent byte errors.
 
 1. Decode frames into 8-bit YUV420p and divide the U plane into 16×16 blocks.
 2. Apply a Haar wavelet transform to each block and take the largest singular value of its LL subband.
 3. Calculate modulation costs from neighboring-block differences and coefficient changes.
-4. Use an educational four-state syndrome-trellis code to choose carrier bits, then quantize the selected singular values with a step of 40.
-5. Reconstruct the modified U plane and encode the video with FFV1. Extraction reverses the bit mapping and checks the recovered payload.
+4. Use the selected trellis and CRF/CQP cost model to choose carrier bits, then
+   quantize using the profile's step. Matrix STC uses an explicit height-three
+   parity-check matrix; the legacy profile retains its original four-state code.
+5. Test quantization targets after inverse transforms, rounding, and clipping;
+   let the trellis choose only recoverable carrier bits. Re-extract each completed
+   U plane and reject any chunk that does not match exactly.
+6. Encode with FFV1, close and reopen the temporary MKV, and verify the full
+   encoded bootstrap, body, parity, and final-chunk padding before publishing
+   the file. This check requires exact bytes before RS repair: a newly encoded
+   lossless output must not need error correction.
 
-The embedding settings are defined in `core/ndca.py` and must match during encoding and decoding; they are not stored in the header.
+Extraction reverses the trellis mapping, repairs the bootstrap, deinterleaves the
+body, applies RS repair, and verifies both integrity checks. NDV4 stores profile
+IDs. Profile 1 fixes Haar, 16×16 blocks, `DELTA = 40`, and the current trellis and
+carrier mapping for both bootstrap and body. Profiles 2–13 use the same fixed
+bootstrap, then switch to the selected body settings at the next frame boundary.
+Unsupported profiles are rejected. See [coding settings](docs/CODING.md).
 
 ### Capacity
 
-Each block supplies one carrier bit, and the trellis needs `3 × message_bits + 2` carriers. One block is excluded because it has no upper or left neighbor. With `B` full blocks in the U plane:
+Each block supplies one carrier bit. One block is excluded because it has no
+upper or left neighbor. With `B` full blocks in the U plane, the legacy profile
+uses `3 × message_bits + 2` carriers:
 
 ```text
 bytes_per_frame = max(0, (B - 3) // 24)
-maximum_file_bytes = frames × bytes_per_frame - 18 - filename_utf8_bytes
+raw_capacity = frames × bytes_per_frame
+required_bytes = 96 + 60 × ceil((filename_utf8_bytes + file_bytes + 4) / 20)
+maximum_file_bytes = 20 × floor((raw_capacity - 96) / 60) - filename_utf8_bytes - 4
 ```
 
-The filename and header are stored once per file, not once per frame. With the current 16×16 blocks:
+For matrix STC at rate `1/w`, body capacity is `floor((B - 1) / (8*w))` bytes per
+frame. Reserve `H = ceil(96 / legacy_bytes_per_frame)` complete bootstrap frames.
+When `frames >= H`, use `raw_capacity = 96 + (frames - H) × body_bytes_per_frame`
+in the formula above. This excludes unused bootstrap-frame slots and accounts for
+RS overhead and codeword padding. Fewer than H frames cannot carry a new-profile
+file. STC rate counts ECC-encoded bits per carrier; payload utilization is a
+separate setting, and the net file rate is lower after RS and metadata.
 
-| Video resolution | Embedded bytes per frame |
+The capacity CLI handles videos too small for the bootstrap and caps the result
+at the 256 MiB implementation limit. The filename and header are stored once per
+file, not once per frame. With 16×16 blocks and the legacy profile:
+
+| Video resolution | Raw embedded bytes per frame (before ECC overhead) |
 | --- | ---: |
 | 640×360 | 9 |
 | 1280×720 | 36 |
@@ -109,20 +186,49 @@ The filename and header are stored once per file, not once per frame. With the c
 
 A negative maximum means even an empty file cannot fit. Payloads are stored without compression or encryption.
 
-### File header
+### File format and error correction
 
-The NDV3 header contains the magic, payload byte length, payload CRC32, and UTF-8
-filename byte length (`>4sQIH`), followed by the filename and the raw file bytes.
-Only the basename is stored. The fixed header uses 18 bytes; filename bytes also
-count toward the video's capacity. CRC32 checks the payload, not the filename.
+NDV4 has a fixed 96-byte protected bootstrap followed by the protected body.
+The 32-byte bootstrap data (`>4sBBBBQHQ2sI`) contains the magic, embedding and ECC
+profile IDs, interleaving depth, flags, payload length, filename length, encoded
+body length, reserved bytes, and a CRC32 over its first 28 bytes. RS(96,32) adds
+64 parity bytes and can correct up to 32 erroneous bytes in this block.
 
-## Current limitations
+The body contains the UTF-8 basename, payload, and a big-endian CRC32 over both.
+It is zero-padded to 20-byte blocks; RS(60,20) adds 40 parity bytes per block and
+can correct up to 20 erroneous bytes per codeword, including errors in parity.
+Groups of up to eight codewords are serialized column-first. The last group uses
+only its actual codewords, with no extra group padding.
 
-- Lossy recompression can corrupt hidden data. There is no error-correction layer; the trellis minimizes embedding cost, and CRC32 only detects payload corruption.
-- Resizing, cropping, dropping frames, or changing frame order can prevent recovery.
-- Input must have even dimensions, usable frame timestamps, and enough U-plane capacity. Midstream resolution changes are unsupported.
-- FFV1 output can be substantially larger than the input video. Frames are converted to 8-bit YUV420p, so original bit depth and pixel format are not preserved.
-- The implementation is a learning prototype, not a complete reproduction or validation of the paper's results.
+Both codes use GF(256), primitive polynomial `0x11d`, generator 2, and first
+consecutive root 0. Correction limits are per-codeword byte counts, not bit counts.
+Beyond those limits RS may fail or miscorrect; CRC checks remain mandatory.
+CRC32 is an accidental-corruption check, not authentication. See
+[the NDV4 wire format](docs/NDV4.md) for exact layouts and decoding rules.
+
+Legacy NDV3 uses an unprotected 18-byte `>4sQIH` header followed by filename and
+payload; its CRC covers only the payload. NDV2 uses a 16-byte `>4sQI` header and
+has no filename. New encoding does not emit these formats.
+
+## Limitations
+
+- Recovery after lossy transcoding is not guaranteed. Resizing, cropping,
+  trimming, duplicated or dropped frames, and frame-rate conversion can prevent
+  recovery by changing carrier alignment.
+- Nominal capacity does not guarantee successful embedding. The encoder rejects
+  chunks that cannot be recovered within its bounded pixel and coefficient changes.
+- Error correction has finite limits: up to 32 erroneous bootstrap bytes and
+  20 erroneous bytes per body codeword. Legacy NDV2/NDV3 headers are unprotected.
+- Inputs need even dimensions, usable timestamps, and sufficient U-plane capacity.
+  Midstream resolution changes are unsupported.
+- FFV1 output can be large. Conversion to 8-bit YUV420p changes the source pixel
+  format and can reduce bit depth. Only the first video stream and compatible
+  audio streams are retained; color metadata, subtitles, and other streams are
+  not fully preserved.
+- Explicit decode file destinations are overwritten without alias checks or atomic
+  replacement. Choose a destination distinct from the input video.
+- Payloads and filenames are unencrypted. CRC detects accidental corruption and
+  does not provide authentication.
 
 ## Reference
 

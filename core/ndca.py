@@ -9,13 +9,17 @@ WAVELET = "haar"
 MESSAGE_BYTES = 3
 
 
-def get_positions(shape, message_bits):
+class EmbeddingError(ValueError):
+    """The requested data could not be embedded and verified reliably."""
+
+
+def get_positions(shape, message_bits, carriers_per_bit=None):
     height, width = shape
     rows = height // BLOCK_SIZE
     cols = width // BLOCK_SIZE
 
     count = rows * cols
-    required = 3 * message_bits + 2
+    required = 3 * message_bits + 2 if carriers_per_bit is None else carriers_per_bit * message_bits
 
     if count - 1 < required:
         raise ValueError(f"Image too small: need {required + 1} blocks, have {count}")
@@ -24,16 +28,16 @@ def get_positions(shape, message_bits):
 
 
 
-def decode_bit(value):
-    return int(np.rint(value / DELTA)) % 2
+def decode_bit(value, delta=DELTA):
+    return int(np.rint(value / delta)) % 2
 
-def encode_bit(value, bit):
-    index = int(np.rint(value / DELTA))
+def encode_bit(value, bit, delta=DELTA):
+    index = int(np.rint(value / delta))
 
     if index % 2 != bit:
-        index += 1 if value >= index * DELTA else -1
+        index += 1 if value >= index * delta else -1
 
-    return index * DELTA
+    return index * delta
 
 def get_coefficient(block):
     LL, _ = pywt.dwt2(block, WAVELET)
@@ -49,7 +53,16 @@ def modify_coefficient(block, value):
 
     return pywt.idwt2((modified_LL, details), WAVELET)
 
-def calculate_costs(image):
+def cost_factor(normalized, model):
+    if model == 'crf':
+        return 1 - normalized + 1e-6
+    if model == 'cqp':
+        return normalized + 1e-6
+    raise ValueError('Unknown cost model')
+
+
+def calculate_costs(image, delta=DELTA, model='crf', return_factor=False):
+    image = np.asarray(image, dtype=np.float64)
     height, width = image.shape
     rows = height // BLOCK_SIZE
     cols = width // BLOCK_SIZE
@@ -83,15 +96,17 @@ def calculate_costs(image):
 
     normalized = (differences - minimum) / (maximum - minimum + 1e-6)
 
-    nearest = np.rint(coefficients / DELTA) * DELTA
+    nearest = np.rint(coefficients / delta) * delta
     small_move = np.abs(coefficients - nearest)
-    large_move = DELTA - small_move
+    large_move = delta - small_move
 
-    factor = 1 - normalized + 1e-6
+    factor = cost_factor(normalized, model)
 
     keep_cost = small_move * factor
     flip_cost = large_move / factor
 
+    if return_factor:
+        return coefficients, factor
     return coefficients, keep_cost, flip_cost
 
 # educational four-state syndrome-trellis code
@@ -99,7 +114,8 @@ def stc_encode(cover, message, keep_costs, flip_costs):
     k = len(message)
     n = len(cover)
 
-    assert n == 3*k + 2
+    if n != 3*k + 2:
+        raise ValueError('Invalid carrier count for the message')
 
     dp = np.full((k+1, 4), np.inf)
     previous = np.full((k+1, 4), -1, dtype=int)
@@ -138,6 +154,8 @@ def stc_encode(cover, message, keep_costs, flip_costs):
 
     state = int(np.argmin(dp[k]))
     minimum_cost = dp[k, state]
+    if not np.isfinite(minimum_cost):
+        raise EmbeddingError('No feasible trellis path for this chunk')
     result = np.zeros(n, dtype=np.uint8)
 
     for i in range(k, 0, -1):
