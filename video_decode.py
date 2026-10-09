@@ -1,6 +1,9 @@
 import argparse
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
+from core.ecc import UncorrectableBodyError
 from core.framing import MessageReader
 from core.config import HEADER_COPIES
 from core.parallel import default_workers, ordered_map
@@ -11,15 +14,29 @@ from core.video_stego import extract_chunk_with_confidence
 
 def recover(filename, *, progress=False, workers=None):
     """Extract, repair, and validate a file without writing to the filesystem."""
+    try:
+        return _recover(filename, progress=progress, workers=workers)
+    except UncorrectableBodyError:
+        # One bounded retry. Do not retry ambiguous repairs, CRC/padding errors,
+        # invalid headers, truncated input or I/O errors. Re-read rather than
+        # retaining a second score array for every otherwise successful file.
+        pass
+    result = _recover(filename, progress=progress, workers=workers,
+                      confidence_model='likelihood')
+    return replace(result, confidence_model='likelihood')
+
+
+def _recover(filename, *, progress=False, workers=None, confidence_model='minimum'):
     reader = MessageReader()
-    status = Progress('Decoding', enabled=progress)
+    label = 'Decoding' if confidence_model == 'minimum' else 'Retrying with likelihood confidence'
+    status = Progress(label, enabled=progress)
     planes = (U for _, U, _ in video_frames(filename))
     frames = 0
 
     # Read all independently padded header groups before processing the body.
     for U in planes:
         frames += 1
-        result = reader.feed_frame(U)
+        result = reader.feed_frame(U, confidence_model=confidence_model)
         status.update(frames, f'{len(reader.received)} encoded bytes read',
                       final=result is not None)
         if result is not None:
@@ -28,7 +45,8 @@ def recover(filename, *, progress=False, workers=None):
             break
 
     if reader.header is not None:
-        tasks = ((extract_chunk_with_confidence, (U,), None) for U in planes)
+        extract = partial(extract_chunk_with_confidence, model=confidence_model)
+        tasks = ((extract, (U,), None) for U in planes)
         results = ordered_map(tasks, workers)
         try:
             for _, (chunk, confidence) in results:
@@ -60,6 +78,8 @@ def decode(filename, output=None, *, progress=True, workers=None):
           f'body {sum(result.body_corrections)} '
           f'(maximum {max(result.body_corrections, default=0)} per codeword)')
     print(f'Recoverable header copies: {result.header_copies_recovered}/{HEADER_COPIES}')
+    if result.confidence_model == 'likelihood':
+        print('Recovered using likelihood-confidence fallback')
     if any(result.body_erasures):
         print(f'Confidence-guided erasure repair: '
               f'{sum(n > 0 for n in result.body_erasures)} body codewords; '

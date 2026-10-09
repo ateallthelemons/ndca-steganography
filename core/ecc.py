@@ -19,6 +19,13 @@ class ECCError(ValueError):
     """A protected block could not be recovered."""
 
 
+class UncorrectableBodyError(ECCError):
+    """No body repair was found; a different receiver ranking may help.
+
+    Ambiguous repairs deliberately remain ECCError and must not trigger retry.
+    """
+
+
 @lru_cache(maxsize=2)
 def _codec(n, k):
     # These parameters are part of the wire format, not library defaults.
@@ -80,7 +87,7 @@ def _repair_with_erasures(codec, word, confidence, number):
         if candidate is None:
             candidate = (part, sum(a != b for a, b in zip(word, repaired)), count)
     if candidate is None:
-        raise ECCError(f'Body Reed–Solomon correction failed at codeword {number} '
+        raise UncorrectableBodyError(f'Body Reed–Solomon correction failed at codeword {number} '
                        '(including confidence-guided erasures)')
     return candidate
 

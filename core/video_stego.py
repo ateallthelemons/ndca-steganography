@@ -101,12 +101,43 @@ def extract_chunk(U, settings=CURRENT):
     return _extract_chunk(U, settings, with_confidence=False)
 
 
-def extract_chunk_with_confidence(U, settings=CURRENT):
-    """Return bytes and per-byte minimum quantizer margin (not probability)."""
-    return _extract_chunk(U, settings, with_confidence=True)
+def extract_chunk_with_confidence(U, settings=CURRENT, *, model='minimum'):
+    """Return unchanged bytes and receiver-only byte reliability scores."""
+    if model not in ('minimum', 'likelihood'):
+        raise ValueError('Unknown confidence model')
+    return _extract_chunk(U, settings, with_confidence=True, model=model)
 
 
-def _extract_chunk(U, settings, *, with_confidence):
+def likelihood_byte_confidence(coefficients, settings=CURRENT):
+    """Approximate byte reliability under a Gaussian quantization-lattice model.
+
+    Use a fixed sigma=delta/2, a uniform lattice prior and nine nearby centers.
+    This is a ranking heuristic, not a calibrated channel probability: codec
+    noise is correlated and neighboring STC bits share supporting carriers.
+    It uses only received coefficients, never payloads or original frames.
+    """
+    values = np.asarray(coefficients, dtype=np.float64) / settings.delta
+    if (values.ndim != 1 or len(values) % (8 * settings.width)
+            or not np.all(np.isfinite(values))):
+        raise ValueError('Invalid carrier coefficients')
+    residual = values - np.rint(values)
+    offsets = np.arange(-4, 5)
+    weights = np.exp(-2 * (residual[:, None] - offsets) ** 2)
+    # Even offsets agree with the hard-decision parity; odd offsets disagree.
+    reliability = np.clip(
+        (weights * np.where(offsets % 2, -1, 1)).sum(axis=1) / weights.sum(axis=1),
+        0, 1)
+    length = len(values) // settings.width
+    bit_reliability = np.ones(length)
+    for column, mask in enumerate(stc.columns(settings.width)):
+        for offset in range(min(stc.HEIGHT, length)):
+            if (mask >> offset) & 1:
+                bit_reliability[offset:] *= reliability[column::settings.width][:length-offset]
+    # For independent parity errors, P(correct XOR)=(1+product(1-2p))/2.
+    return ((1 + bit_reliability) / 2).reshape(-1, 8).prod(axis=1)
+
+
+def _extract_chunk(U, settings, *, with_confidence, model='minimum'):
     size = chunk_size(U.shape, settings)
     if not size:
         raise ValueError('U plane too small for embedding')
@@ -123,6 +154,8 @@ def _extract_chunk(U, settings, *, with_confidence):
     data = np.packbits(bits).tobytes()
     if not with_confidence:
         return data
+    if model == 'likelihood':
+        return data, likelihood_byte_confidence(coefficients, settings)
     margins = np.asarray(margins)
     confidence = np.full(len(bits), np.inf)
     for column, mask in enumerate(stc.columns(settings.width)):

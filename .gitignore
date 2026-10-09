@@ -7,3 +7,6 @@ materials/
 tests/
 benchmark-runs/
 benchmarks/
+docs/DECODER_CONFIDENCE.md
+docs/TODO.md
+docs/YOUTUBE_EXPERIMENT.md

@@ -67,6 +67,12 @@ the body. Failed body codewords get bounded retries using received coefficient
 confidence as erasure rankings. Conflicting repairs and failed integrity checks
 are rejected before writing a recovered file.
 
+If the existing video decoder cannot repair a body word, it makes one additional
+pass with a likelihood-based confidence ranking. Successful first-pass results
+are returned immediately. This receiver-only fallback preserves NDV5 files and
+payload capacity; see [confidence recovery](docs/DECODER_CONFIDENCE.md) for the
+model, validation and limits.
+
 See [coding](docs/CODING.md), [NDV5 format](docs/NDV5.md), and
 [parallel processing](docs/PARALLEL.md) for implementation details.
 

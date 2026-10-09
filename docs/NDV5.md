@@ -57,6 +57,18 @@ The mixed correction condition is `2e + s <= 40`, with e the unknown errors
 outside s erased positions. This receiver heuristic changes no wire bytes, rates,
 profile IDs, or bootstrap behavior. Whole-file integrity checks remain mandatory.
 
+The video decoder first uses the minimum-margin policy above. Only an
+uncorrectable body word (no candidate, not an ambiguous repair) triggers one
+additional video pass using likelihood confidence. CRC, padding, header,
+truncation and I/O errors do not trigger this fallback. It retains the same hard
+decisions, RS parameters, 1–32 erasure trials per failed word, and ambiguity and
+integrity checks. The alternative score uses a Gaussian lattice model with fixed
+sigma=delta/2, propagates carrier reliability through the STC XOR supports, and
+multiplies approximate bit reliabilities within each byte. It is a heuristic
+ranking, not a calibrated probability. Details and evidence are in
+[confidence recovery](DECODER_CONFIDENCE.md). Byte-only readers retain their
+existing behavior; the video-level retry requires re-reading received pixels.
+
 ## Bootstrap
 
 Each 96-byte copy is one protected bootstrap. RS-decode this block

@@ -42,6 +42,7 @@ class Recovery:
     body_corrections: tuple = ()
     header_copies_recovered: int = 1
     body_erasures: tuple = ()
+    confidence_model: str = 'minimum'
 
 
 def filename_bytes(name):
@@ -181,13 +182,13 @@ class MessageReader:
             raise ValueError('Video ended before a complete payload was recovered')
         return self.result
 
-    def feed_frame(self, plane):
+    def feed_frame(self, plane, *, confidence_model='minimum'):
         """Discard spare slots independently at the end of each header group."""
         from .video_stego import extract_chunk_with_confidence
         from .layout import frame_chunk
         if self.result is not None:
             return self.result
-        chunk, confidence = extract_chunk_with_confidence(plane)
+        chunk, confidence = extract_chunk_with_confidence(plane, model=confidence_model)
         if self.header is None:
             plan = frame_chunk(plane.shape, self.bootstrap_size, self.frames)
             chunk, confidence = chunk[:plan.length], confidence[:plan.length]
