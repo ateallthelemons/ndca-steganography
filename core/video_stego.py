@@ -1,38 +1,10 @@
 import numpy as np
-from .profiles import LEGACY, get_profile
+from .config import BLOCK_SIZE, CURRENT
 from . import stc
-
 from .ndca import (
-    BLOCK_SIZE, DELTA, EmbeddingError, get_positions, get_coefficient,
-    modify_coefficient, decode_bit, calculate_costs, stc_encode, stc_decode,
-    image_blocks, haar_dwt2, haar_idwt2, get_coefficients, decode_bits
+    EmbeddingError, get_positions, calculate_costs,
+    image_blocks, haar_dwt2, haar_idwt2, get_coefficients, decode_bits,
 )
-
-
-# Encoder-only search limits; extraction and the on-disk format are unchanged.
-MAX_COEFFICIENT_SHIFT = 2 * DELTA
-MAX_PIXEL_CHANGE = DELTA
-
-
-def reconstruct_carrier(block, coefficient, bit, profile=LEGACY):
-    """Find the nearest bounded target whose bit survives pixel reconstruction.
-
-    Every attempt starts from the original block. Return None when this bit is
-    unavailable within the search/distortion limits, so the trellis can avoid it.
-    """
-    profile = get_profile(profile)
-    delta = profile.delta
-    low = max(0, int(np.ceil((coefficient - 2 * delta) / delta)))
-    high = int(np.floor((coefficient + 2 * delta) / delta))
-    targets = [i * delta for i in range(low, high + 1) if i % 2 == bit]
-    targets.sort(key=lambda target: (abs(target - coefficient), target))
-    for target in targets:
-        pixels = np.clip(np.rint(modify_coefficient(block, target)), 0, 255).astype(np.uint8)
-        if np.max(np.abs(pixels.astype(np.float64) - block)) > delta:
-            continue
-        if decode_bit(get_coefficient(pixels.astype(np.float64)), delta) == bit:
-            return pixels, abs(target - coefficient)
-    return None
 
 
 # Target indices i (target i * delta) per carrier: at most five fit in +-2 delta.
@@ -40,7 +12,7 @@ TARGET_SLOTS = 5
 
 
 def reconstruct_carriers(blocks, coefficients, delta):
-    """Batched reconstruct_carrier for both bits of every block.
+    """Find bounded, recoverable pixel candidates for both bits of every block.
 
     Returns pixels (n, 2, BLOCK_SIZE, BLOCK_SIZE), movement (n, 2) and a
     boolean found (n, 2); entries with found False correspond to None. Every
@@ -82,42 +54,33 @@ def reconstruct_carriers(blocks, coefficients, delta):
     return chosen_pixels, movement, found
 
 
-def chunk_size(shape, profile=LEGACY):
-    profile = get_profile(profile)
+def chunk_size(shape, settings=CURRENT):
     height, width = shape
     blocks = (height // BLOCK_SIZE) * (width // BLOCK_SIZE)
-    if profile.stc == 'legacy':
-        return max(0, ((blocks - 3) // 3) // 8)
-    return max(0, (blocks - 1) // (8 * profile.width))
+    return max(0, (blocks - 1) // (8 * settings.width))
 
 
-def embed_chunk(U, data, profile=LEGACY):
-    profile = get_profile(profile)
-    if len(data) != chunk_size(U.shape, profile) or not data:
+def embed_chunk(U, data, settings=CURRENT):
+    if len(data) != chunk_size(U.shape, settings) or not data:
         raise ValueError('Invalid chunk size for this frame')
 
     image = U.astype(np.float64)
     bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
-    positions = get_positions(image.shape, len(bits), None if profile.stc == 'legacy' else profile.width)
+    positions = get_positions(image.shape, len(bits), settings.width)
 
-    coefficients, factors = calculate_costs(image, profile.delta, profile.cost, return_factor=True)
+    coefficients, factors = calculate_costs(image, settings.cost)
     coefficients = coefficients.ravel()[positions]
     factors = factors.ravel()[positions]
 
-    cover = decode_bits(coefficients, profile.delta)
+    cover = decode_bits(coefficients, settings.delta)
     blocks = image_blocks(image).reshape(-1, BLOCK_SIZE, BLOCK_SIZE)[positions]
-    candidates, movement, found = reconstruct_carriers(blocks, coefficients, profile.delta)
+    candidates, movement, found = reconstruct_carriers(blocks, coefficients, settings.delta)
     keep = np.arange(2) == cover[:, None]
     costs = np.where(keep, movement * factors[:, None], movement / factors[:, None])
     costs[~found] = np.inf
 
-    if profile.stc == 'legacy':
-        indices = np.arange(len(positions))
-        stego_bits, cost = stc_encode(cover, bits, costs[indices, cover], costs[indices, 1-cover])
-        recovered = stc_decode(stego_bits)
-    else:
-        stego_bits, cost = stc.embed(bits, costs, profile.width)
-        recovered = stc.extract(stego_bits, profile.width)
+    stego_bits, cost = stc.embed(bits, costs, settings.width)
+    recovered = stc.extract(stego_bits, settings.width)
     if not np.array_equal(recovered, bits):
         raise EmbeddingError('Trellis failed to reproduce the requested message')
 
@@ -129,47 +92,43 @@ def embed_chunk(U, data, profile=LEGACY):
     x = (cols * BLOCK_SIZE)[:, None, None] + offsets
     result[y, x] = chosen
 
-    if extract_chunk(result, profile) != data:
+    if extract_chunk(result, settings) != data:
         raise EmbeddingError('Chunk failed recovery after pixel reconstruction')
     return result, cost
 
 
-def extract_chunk(U, profile=LEGACY):
-    return _extract_chunk(U, profile, with_confidence=False)
+def extract_chunk(U, settings=CURRENT):
+    return _extract_chunk(U, settings, with_confidence=False)
 
 
-def extract_chunk_with_confidence(U, profile=LEGACY):
+def extract_chunk_with_confidence(U, settings=CURRENT):
     """Return bytes and per-byte minimum quantizer margin (not probability)."""
-    return _extract_chunk(U, profile, with_confidence=True)
+    return _extract_chunk(U, settings, with_confidence=True)
 
 
-def _extract_chunk(U, profile, *, with_confidence):
-    profile = get_profile(profile)
-    size = chunk_size(U.shape, profile)
+def _extract_chunk(U, settings, *, with_confidence):
+    size = chunk_size(U.shape, settings)
     if not size:
         raise ValueError('U plane too small for embedding')
 
     image = U.astype(np.float64)
-    positions = get_positions(image.shape, size * 8, None if profile.stc == 'legacy' else profile.width)
+    positions = get_positions(image.shape, size * 8, settings.width)
     blocks = image_blocks(image).reshape(-1, BLOCK_SIZE, BLOCK_SIZE)[positions]
     coefficients = get_coefficients(blocks)
-    carrier = decode_bits(coefficients, profile.delta)
+    carrier = decode_bits(coefficients, settings.delta)
     if with_confidence:
-        values = coefficients / profile.delta
-        margins = profile.delta * (0.5 - np.abs(values - np.rint(values)))
-    bits = stc_decode(carrier) if profile.stc == 'legacy' else stc.extract(carrier, profile.width)
+        values = coefficients / settings.delta
+        margins = settings.delta * (0.5 - np.abs(values - np.rint(values)))
+    bits = stc.extract(carrier, settings.width)
     data = np.packbits(bits).tobytes()
     if not with_confidence:
         return data
     margins = np.asarray(margins)
-    if profile.stc == 'legacy':
-        confidence = np.array([margins[3*i:3*i+5].min() for i in range(len(bits))])
-    else:
-        confidence = np.full(len(bits), np.inf)
-        for column, mask in enumerate(stc.columns(profile.width)):
-            for offset in range(min(stc.HEIGHT, len(bits))):
-                if (mask >> offset) & 1:
-                    confidence[offset:] = np.minimum(
-                        confidence[offset:],
-                        margins[column::profile.width][:len(bits)-offset])
+    confidence = np.full(len(bits), np.inf)
+    for column, mask in enumerate(stc.columns(settings.width)):
+        for offset in range(min(stc.HEIGHT, len(bits))):
+            if (mask >> offset) & 1:
+                confidence[offset:] = np.minimum(
+                    confidence[offset:],
+                    margins[column::settings.width][:len(bits)-offset])
     return data, confidence.reshape(-1, 8).min(axis=1)

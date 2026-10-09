@@ -4,7 +4,6 @@ __pycache__/
 research/
 materials/
 .DS_Store
-tests/*
-!tests/test_decoder_confidence.py
+tests/
 benchmark-runs/
 benchmarks/

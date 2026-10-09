@@ -6,24 +6,23 @@ from pathlib import Path
 import av
 
 from core.ndca import EmbeddingError
-from core.framing import MAX_PAYLOAD_BYTES, pack_message, require_embedding_profile
-from core.profiles import LEGACY, get_profile, add_profile_arguments, profile_from_args
+from core.framing import MAX_PAYLOAD_BYTES, pack_message
 from core.layout import frame_chunk
 from core.parallel import default_workers, ordered_map
 from core.progress import Progress
 from core.video_io import unpack_video_frame, make_video_frame, rescale, video_frames
 from core.video_stego import chunk_size, embed_chunk, extract_chunk
 
-def embed_frame(U, part, profile, number):
+def embed_frame(U, part, number):
     """Embed one frame's chunk; runs in a worker process."""
     try:
-        U, _ = embed_chunk(U, part) if profile == LEGACY else embed_chunk(U, part, profile)
+        U, _ = embed_chunk(U, part)
         return U
     except EmbeddingError as error:
         raise EmbeddingError(f'Embedding failed at frame {number}: {error}') from error
 
 
-def verify_saved_video(filename, message, dimensions, expected_frames, profile=LEGACY,
+def verify_saved_video(filename, message, dimensions, expected_frames,
                        *, progress=False, workers=None):
     """Read the closed file and compare all embedded bytes, including padding."""
     status = Progress('Verifying saved video', enabled=progress)
@@ -34,10 +33,10 @@ def verify_saved_video(filename, message, dimensions, expected_frames, profile=L
             if (Y.shape[1], Y.shape[0]) != dimensions:
                 raise EmbeddingError(f'Saved video dimensions changed at frame {index + 1}')
             if planned < len(message):
-                plan = frame_chunk(U.shape, len(message), index, profile)
+                plan = frame_chunk(U.shape, len(message), index)
                 expected = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
                 planned += plan.length
-                yield extract_chunk, (U, plan.profile), (plan.length, expected)
+                yield extract_chunk, (U,), (plan.length, expected)
             else:
                 yield None, (), (0, None)
 
@@ -65,16 +64,14 @@ def check_output_path(destination, *sources):
             raise ValueError('Output must not alias the input video or payload')
 
 
-def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True, workers=None):
-    require_embedding_profile()
-    profile = get_profile(profile)
+def encode(input_name, output_name, payload, *, progress=True, workers=None):
     destination = Path(output_name)
     payload_path = Path(payload)
     check_output_path(destination, input_name, payload_path)
     if payload_path.stat().st_size > MAX_PAYLOAD_BYTES:
         raise ValueError(f'Payload exceeds supported limit of {MAX_PAYLOAD_BYTES} bytes')
     data = payload_path.read_bytes()
-    message = pack_message(payload_path.name, data, profile)
+    message = pack_message(payload_path.name, data)
     status = Progress('Encoding', enabled=progress)
 
     total = 0
@@ -124,20 +121,20 @@ def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True, w
                         if (frame.width, frame.height) != dimensions:
                             raise ValueError('Midstream resolution changes are not supported')
                         Y, U, V = unpack_video_frame(frame)
-                        size = chunk_size(U.shape, profile)
+                        size = chunk_size(U.shape)
                         if not size:
                             raise ValueError('Video too small: no available U-plane payload capacity')
                         if index == 0:
-                            print(f'Frame size: {frame.width}x{frame.height}, body: {size} bytes/frame, profile: {profile.name}')
+                            print(f'Frame size: {frame.width}x{frame.height}, body: {size} bytes/frame')
                         if frame.pts is None or frame.time_base is None:
                             raise ValueError('Input video frame has no usable timestamp')
                         pts = rescale(frame.pts, frame.time_base, time_base)
 
                         function, args = None, ()
                         if total < len(message):
-                            plan = frame_chunk(U.shape, len(message), index, profile)
+                            plan = frame_chunk(U.shape, len(message), index)
                             part = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
-                            function, args = embed_frame, (U, part, plan.profile, index + 1)
+                            function, args = embed_frame, (U, part, index + 1)
                             total += plan.length
                         yield function, args, (Y, U, V, pts)
                         index += 1
@@ -154,7 +151,7 @@ def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True, w
             for out_packet in output_video.encode(None):
                 target.mux(out_packet)
         status.update(frames, f'{total}/{len(message)} message bytes embedded', final=True)
-        verify_saved_video(str(temporary_path), message, dimensions, frames, profile,
+        verify_saved_video(str(temporary_path), message, dimensions, frames,
                            progress=progress, workers=workers)
         temporary_path.replace(destination)
     finally:
@@ -168,12 +165,7 @@ if __name__ == '__main__':
     parser.add_argument('input', help='Input video')
     parser.add_argument('payload', help='File to hide')
     parser.add_argument('output', help='Output MKV file')
-    add_profile_arguments(parser)
     parser.add_argument('--workers', type=int, default=default_workers(),
                         help='CPU processes for per-frame work (default: all cores; 1 disables)')
     args = parser.parse_args()
-    try:
-        profile = profile_from_args(args)
-    except ValueError as error:
-        parser.error(str(error))
-    encode(args.input, args.output, args.payload, profile, workers=args.workers)
+    encode(args.input, args.output, args.payload, workers=args.workers)

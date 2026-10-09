@@ -1,4 +1,4 @@
-"""NDV4's fixed byte-oriented Reed-Solomon codes and interleaving order."""
+"""NDV5's fixed byte-oriented Reed-Solomon codes and interleaving order."""
 from functools import lru_cache
 
 import numpy as np

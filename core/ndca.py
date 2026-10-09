@@ -1,61 +1,24 @@
-
 import numpy as np
-import pywt
-
-# CONFIG
-BLOCK_SIZE = 16
-DELTA = 40
-WAVELET = "haar"
-MESSAGE_BYTES = 3
+from .config import BLOCK_SIZE, CURRENT
 
 
 class EmbeddingError(ValueError):
     """The requested data could not be embedded and verified reliably."""
 
 
-def get_positions(shape, message_bits, carriers_per_bit=None):
+def get_positions(shape, message_bits, carriers_per_bit=CURRENT.width):
     height, width = shape
     rows = height // BLOCK_SIZE
     cols = width // BLOCK_SIZE
 
     count = rows * cols
-    required = 3 * message_bits + 2 if carriers_per_bit is None else carriers_per_bit * message_bits
+    required = carriers_per_bit * message_bits
 
     if count - 1 < required:
         raise ValueError(f"Image too small: need {required + 1} blocks, have {count}")
 
     return np.linspace(1, count - 1, required, dtype=int)
 
-
-
-def decode_bit(value, delta=DELTA):
-    return int(np.rint(value / delta)) % 2
-
-def encode_bit(value, bit, delta=DELTA):
-    index = int(np.rint(value / delta))
-
-    if index % 2 != bit:
-        index += 1 if value >= index * delta else -1
-
-    return index * delta
-
-def get_coefficient(block):
-    LL, _ = pywt.dwt2(block, WAVELET)
-    S = np.linalg.svd(LL, compute_uv=False)
-    return S[0]
-
-def modify_coefficient(block, value):
-    LL, details = pywt.dwt2(block, WAVELET)
-    U, S, Vt = np.linalg.svd(LL, full_matrices=False)
-
-    S[0] = value
-    modified_LL = (U * S) @ Vt
-
-    return pywt.idwt2((modified_LL, details), WAVELET)
-
-# Batched Haar/SVD helpers. Each repeats pywt's and LAPACK's per-block arithmetic
-# in the same order, so results are bit-identical to the single-block functions
-# above. Inputs are stacks of blocks with shape (..., BLOCK_SIZE, BLOCK_SIZE).
 HAAR = np.sqrt(0.5)
 
 
@@ -101,13 +64,13 @@ def haar_idwt2(LL, details):
 
 
 def get_coefficients(blocks):
-    """Batched get_coefficient."""
+    """Largest LL singular value of each block."""
     LL, _ = haar_dwt2(blocks)
     return np.linalg.svd(LL, compute_uv=False)[..., 0]
 
 
-def decode_bits(values, delta=DELTA):
-    """Batched decode_bit."""
+def decode_bits(values, delta=CURRENT.delta):
+    """Extract quantization parity for a batch of coefficients."""
     return (np.rint(np.asarray(values) / delta).astype(np.int64) % 2).astype(np.uint8)
 
 
@@ -119,7 +82,8 @@ def cost_factor(normalized, model):
     raise ValueError('Unknown cost model')
 
 
-def calculate_costs(image, delta=DELTA, model='crf', return_factor=False):
+def calculate_costs(image, model=CURRENT.cost):
+    """Return LL coefficients and normalized neighbor-cost factors."""
     image = np.asarray(image, dtype=np.float64)
     height, width = image.shape
     rows = height // BLOCK_SIZE
@@ -141,81 +105,4 @@ def calculate_costs(image, delta=DELTA, model='crf', return_factor=False):
 
     normalized = (differences - minimum) / (maximum - minimum + 1e-6)
 
-    nearest = np.rint(coefficients / delta) * delta
-    small_move = np.abs(coefficients - nearest)
-    large_move = delta - small_move
-
-    factor = cost_factor(normalized, model)
-
-    keep_cost = small_move * factor
-    flip_cost = large_move / factor
-
-    if return_factor:
-        return coefficients, factor
-    return coefficients, keep_cost, flip_cost
-
-# educational four-state syndrome-trellis code
-def stc_encode(cover, message, keep_costs, flip_costs):
-    k = len(message)
-    n = len(cover)
-
-    if n != 3*k + 2:
-        raise ValueError('Invalid carrier count for the message')
-
-    dp = np.full((k+1, 4), np.inf)
-    previous = np.full((k+1, 4), -1, dtype=int)
-    choices = np.full((k+1, 4, 3), -1, dtype=int)
-
-    def cost(i, bit):
-        return keep_costs[i] if bit == cover[i] else flip_costs[i]
-
-    for a in [0, 1]:
-        for b in [0, 1]:
-            state = 2*a + b
-            dp[0, state] = cost(0, a) + cost(1, b)
-
-    for i in range(k):
-        start = 3*i + 2
-
-        for state in range(4):
-            a, b = divmod(state, 2)
-
-            for c in [0, 1]:
-                for d in [0, 1]:
-                    for e in [0, 1]:
-                        if (a ^ b ^ c ^ d ^ e) != message[i]:
-                            continue
-
-                        new_state = 2*d + e
-                        total = dp[i, state]
-                        total += cost(start, c)
-                        total += cost(start+1, d)
-                        total += cost(start+2, e)
-
-                        if total < dp[i+1, new_state]:
-                            dp[i+1, new_state] = total
-                            previous[i+1, new_state] = state
-                            choices[i+1, new_state] = [c, d, e]
-
-    state = int(np.argmin(dp[k]))
-    minimum_cost = dp[k, state]
-    if not np.isfinite(minimum_cost):
-        raise EmbeddingError('No feasible trellis path for this chunk')
-    result = np.zeros(n, dtype=np.uint8)
-
-    for i in range(k, 0, -1):
-        result[3*(i-1)+2:3*(i-1)+5] = choices[i, state]
-        state = previous[i, state]
-
-    result[:2] = divmod(state, 2)
-
-    return result, minimum_cost
-
-def stc_decode(carrier):
-    k = (len(carrier) - 2) // 3
-    message = np.zeros(k, dtype=np.uint8)
-
-    for i in range(k):
-        message[i] = np.bitwise_xor.reduce(carrier[3*i:3*i+5])
-
-    return message
+    return coefficients, cost_factor(normalized, model)

@@ -4,13 +4,13 @@ from pathlib import Path
 import av
 
 from core.ecc import HEADER_SIZE
-from core.framing import filename_bytes, maximum_payload, MAX_PAYLOAD_BYTES, require_embedding_profile
+from core.config import HEADER_COPIES
+from core.framing import filename_bytes, maximum_payload, MAX_PAYLOAD_BYTES
 from core.video_stego import chunk_size
-from core.profiles import LEGACY, add_profile_arguments, profile_from_args, bootstrap_copies
 from core.layout import message_capacity, bootstrap_frames
 
 
-def capacity(input_name, profile=LEGACY):
+def capacity(input_name):
     """Count decoded frames to calculate capacity using the current embedding settings."""
     frames = 0
     dimensions = None
@@ -26,8 +26,8 @@ def capacity(input_name, profile=LEGACY):
                 raise ValueError('This 8-bit YUV420p version needs even video dimensions')
             if dimensions is None:
                 dimensions = current_dimensions
-                bytes_per_frame = chunk_size((frame.height // 2, frame.width // 2), profile)
-                bootstrap_frames((frame.height // 2, frame.width // 2), profile)
+                bytes_per_frame = chunk_size((frame.height // 2, frame.width // 2))
+                bootstrap_frames((frame.height // 2, frame.width // 2))
                 if not bytes_per_frame:
                     raise ValueError('Video too small: no available U-plane payload capacity')
             elif current_dimensions != dimensions:
@@ -45,27 +45,22 @@ def main():
     parser = argparse.ArgumentParser(description='Check maximum file size using the current embedding settings.')
     parser.add_argument('input', help='Input video (scans all frames for an accurate count)')
     parser.add_argument('--filename', help='Payload filename or path; the file need not exist')
-    add_profile_arguments(parser)
     args = parser.parse_args()
 
     name = Path(args.filename).name if args.filename is not None else None
     try:
-        require_embedding_profile()
-        profile = profile_from_args(args)
         name_size = len(filename_bytes(name)) if name is not None else 1
-        (width, height), frames, per_frame = capacity(args.input, profile)
+        (width, height), frames, per_frame = capacity(args.input)
     except (ValueError, OSError, av.error.FFmpegError) as error:
         parser.exit(1, f'Error: {error}\n')
 
-    total = message_capacity((height // 2, width // 2), frames, profile)
-    maximum = maximum_payload(total, name_size, profile)
+    total = message_capacity((height // 2, width // 2), frames)
+    maximum = maximum_payload(total, name_size)
     print(f'Video: {width}x{height}, {frames:,} frames')
-    print(f'Embedding profile: {profile.name}')
     print(f'Body capacity per frame before RS: {per_frame:,} bytes')
-    if profile != LEGACY:
-        print(f'Reserved bootstrap frames: {bootstrap_frames((height // 2, width // 2), profile)}')
+    print(f'Reserved bootstrap frames: {bootstrap_frames((height // 2, width // 2))}')
     print(f'Framed message capacity (excludes bootstrap-frame padding): {total:,} bytes')
-    print(f'{profile.version}: {bootstrap_copies(profile)} x {HEADER_SIZE}-byte protected bootstrap; '
+    print(f'NDV5: {HEADER_COPIES} x {HEADER_SIZE}-byte protected bootstrap; '
           'RS(60,20) body, including filename and CRC32')
     print(f'Payload implementation limit: {MAX_PAYLOAD_BYTES:,} bytes')
     if maximum < 0:

@@ -1,82 +1,129 @@
-# NDV5 experimental robust profile
+# NDV5 wire format
 
-NDV5 is selected only with `--profile experimental-robust80` (profile ID 14).
-It is a compression-resilience candidate, not a guarantee of YouTube recovery.
-The production decoder's confidence-guided body RS fallback has recovered the
-complete 48,485-byte EPUB from the tested H.264 rendition of `2Mx3Aq-qK0I`.
-The AV1 rendition still fails. This is one demonstrated successful round trip;
-see the [audit](NDCA_IMPLEMENTATION_AUDIT.md) for the experiment and limitations.
-Existing NDV2/NDV3/NDV4 decoding and NDV4 profile IDs 1–13 remain unchanged.
+All integers are unsigned and big-endian; data bits within bytes are embedded
+most-significant first. Lengths are in bytes. The file tools use only this mapping.
 
-## Fixed physical mapping
+## Physical mapping
 
-The bootstrap and body both use Haar DWT/LL-SVD on 16×16 blocks in the 8-bit
-YUV420p U plane. The height-three matrix STC has rate 1/2, columns `(7, 5)`, and
-the same carrier ordering and termination as the NDV4 matrix profiles. Delta is
-80 and embedding uses CRF costs. These settings are known before reading metadata.
-Reconstruction searches within twice delta in coefficient space and limits pixel
-changes to delta, as for other profiles. The decoder does not accept a caller's
-guessed delta or unvalidated metadata as a mapping instruction.
+Header and body use the 8-bit YUV420p U plane, Haar DWT on 16×16 blocks, the largest
+LL singular value, rounded quantization parity at delta 80, and height-three matrix
+STC at rate 1/2. Column masks are `(7, 5)`, low bit first. For message row r,
+carrier `2*r+j` contributes bit t of mask j to syndrome row r+t when that row
+exists. Columns truncate at the final row. Initial and terminal trellis states are
+zero; there are no extra tail carriers. Extraction is `H y mod 2`.
 
-## Header copies and framing
+For B full blocks, each frame holds S = floor((B-1)/16) bytes. Choose exactly
+16*S carriers using `np.linspace(1, B-1, 16*S, dtype=int)`. Block zero is excluded.
+These settings are known before decoding metadata; no guessed mapping is accepted.
 
-The 32-byte header structure and RS(96,32) parameters are specified in
-[NDV4](NDV4.md). NDV5 changes the magic to ASCII `NDV5` and embedding profile to
-14. ECC profile 1, interleaving depth 8, zero flags/reserved bytes, length checks,
-and header CRC32 are unchanged. Version and profile must match.
+## Header groups
 
-The logical message is:
+The logical message is three identical 96-byte protected headers followed by the
+protected body. Each header occupies H = ceil(96/S) whole frames. Groups start at
+frame indices 0, H, and 2H; the body starts at 3H. Zero-fill the unused slots of
+each group's last frame and discard those slots during recovery.
+
+Repair and validate all three copies independently. At least one must be valid;
+all valid copies must agree on metadata. Reject conflicts. Report the number of
+valid copies and the fewest corrected bytes among them. Consecutive groups do not
+guarantee survival of correlated damage across all copies.
+
+## Reed–Solomon settings
+
+Both codes are shortened byte-symbol codes over GF(256), primitive polynomial
+`0x11d`, generator `2`, first consecutive root `0`. The implementation uses
+`reedsolo==1.7.0` with explicit `c_exp=8`, `prim=0x11d`, `generator=2`, `fcr=0`.
+Encoding is systematic: data bytes precede parity bytes before interleaving.
+
+- Bootstrap: `RSCodec(64, nsize=96, ...)`, exactly 32 data + 64 parity bytes.
+- ECC profile 1 body: `RSCodec(40, nsize=60, ...)`, exactly 20 data + 40 parity bytes.
+
+Bootstrap decoding uses unknown-error correction. Body decoding tries ordinary
+correction first, then retries failed words using received-pixel confidence when
+available. The byte-only `MessageReader.feed()` API retains ordinary correction
+unless confidence is explicitly supplied.
+The guaranteed correction limits are 32 and 20 erroneous bytes respectively per
+codeword for unknown errors, including errors in parity. Beyond these limits decoding may fail or
+miscorrect. CRC checks are therefore mandatory after correction.
+
+For body retries, the receiver measures each coefficient's distance to the nearest
+quantization boundary, takes the minimum over the carriers supporting each STC
+message bit, then the minimum over eight bits per byte. Confidence follows the
+same frame-padding removal and deinterleaving as data. Each failed word gets at
+most 32 additional RS trials, erasing its 1–32 least-confident bytes in stable
+wire-derived order. All successful trials must yield identical data; otherwise
+the word is rejected as ambiguous. A word with no successful trial is rejected.
+The mixed correction condition is `2e + s <= 40`, with e the unknown errors
+outside s erased positions. This receiver heuristic changes no wire bytes, rates,
+profile IDs, or bootstrap behavior. Whole-file integrity checks remain mandatory.
+
+## Bootstrap
+
+Each 96-byte copy is one protected bootstrap. RS-decode this block
+**before checking its magic**. Its 32 corrected data bytes have this layout:
+
+| Offset | Bytes | Field | Accepted value |
+| --- | ---: | --- | --- |
+| 0 | 4 | Magic/version | ASCII `NDV5` |
+| 4 | 1 | Embedding profile | 14 |
+| 5 | 1 | Body ECC profile | 1 |
+| 6 | 1 | Body interleaving depth | 8 |
+| 7 | 1 | Flags | 0 |
+| 8 | 8 | Payload length | 0 through 268,435,456 in this implementation |
+| 16 | 2 | UTF-8 basename length | 1 through 65,535 |
+| 18 | 8 | Encoded body length | Must equal formula below |
+| 26 | 2 | Reserved | Both zero |
+| 28 | 4 | CRC32 | `zlib.crc32` of bytes 0–27 |
+
+Python struct: `>4sBBBBQHQ2sI`. Validate the header CRC, identifiers, flags,
+reserved bytes, length bounds, and derived body size before consuming the body.
+No length field is used to preallocate an output buffer. The 256 MiB payload
+limit reflects the current buffering design.
+
+## Body
+
+Raw body bytes are:
 
 ```text
-96-byte protected header | identical header | identical header | protected body
+UTF-8 basename | payload | CRC32(basename bytes + payload)
 ```
 
-Each copy occupies its own group of complete frames. With S bytes per frame,
-one group uses H = ceil(96 / S) frames. Copy groups start at frame indices 0, H,
-and 2H. Zero-fill each group's last frame's spare slots. The body starts at frame
-3H. Copies are in distinct, consecutive frame groups; there is no gap or placement
-near the end of the video. This protects against damage localized to one group,
-but does not guarantee survival of correlated damage across all three groups.
+The checksum occupies four big-endian bytes. Zero-pad the final raw block to 20
+bytes. Encode every block independently into 60 bytes; even an empty payload
+has a filename and checksum, and therefore at least one body codeword.
 
-Repair each copy independently, then validate its CRC, version/profile, lengths,
-flags and reserved bytes. Wait for all three groups before consuming body data.
-At least one valid copy is required. All valid copies must agree on metadata;
-otherwise reject the video. Invalid copies are discarded. Use the valid copy
-requiring the fewest RS byte corrections for the reported header correction count;
-also report the number of independently recoverable copies. There is no majority
-voting over unvalidated header bits.
+For each group of up to eight codewords, place codewords in rows of a matrix
+with 60 columns and serialize by columns. Thus a two-codeword group `A, B`
+becomes `A[0], B[0], A[1], B[1], ..., A[59], B[59]`. The final group has only the
+remaining codewords, not eight padded rows. All group sizes derive from the
+validated encoded body length; no additional delimiters are present.
 
-The RS(60,20) body, interleaving, basename, payload CRC32 and zero padding are
-identical to NDV4. The body's declared length excludes all header copies and frame
-padding. The receiver can use the confidence-guided erasure fallback documented
-in [NDV4](NDV4.md), with no format change. No recovered file is written before
-the complete body passes validation.
+Reverse this permutation, RS-decode each codeword, concatenate data bytes, and
+validate the raw-body checksum and zero padding. Decode and validate the basename
+only after integrity checks. Empty names, `.`/`..`, slash, backslash, NUL, colon,
+invalid UTF-8, and overlong names are rejected. Never write a recovered file until
+all correction and integrity checks succeed.
 
-## Detection and compatibility
+## Capacity and padding
 
-The video reader attempts the existing NDV4/legacy mapping and the fixed NDV5
-mapping until a header validates. Each attempt buffers only its own extracted
-bytes. An invalid first NDV5 copy must not stop the remaining copies from being
-tried. Once a header validates, its reader owns the rest of the extraction; body
-failures remain failures. Legacy short messages are finalized at end of video.
-
-Older decoders cannot read NDV5. Use the updated decoder for the upload trial.
-Resizing, trimming, dropped/duplicated frames and frame reordering are unsupported.
-
-## Exact capacity and lossless verification
-
-For F frames, B full U-plane blocks and UTF-8 filename length N:
+For F frames, B full U blocks, N UTF-8 filename bytes, and P payload bytes:
 
 ```text
 S = floor((B - 1) / 16)
 H = ceil(96 / S)
-reserved_bootstrap_frames = 3 * H
-C = 288 + (F - 3*H) * S       # requires F >= 3*H and S > 0
-encoded_size = 288 + 60 * ceil((N + payload_bytes + 4) / 20)
+encoded_body_length = 60 * ceil((N + P + 4) / 20)
+total_message_length = 288 + encoded_body_length
+C = 288 + (F - 3*H) * S
 maximum_payload = min(268435456, 20 * floor((C - 288) / 60) - N - 4)
 ```
 
-If the reserved frames or even an empty file do not fit, no file fits. The encoder
-checks reconstructed pixels and verifies every byte of all three copies, body,
-and outer padding from the saved FFV1 file. A lossless output is rejected even
-when RS or another header copy could conceal an embedding error.
+Require S > 0 and F >= 3H. If even an empty payload does not fit, no file fits.
+Zero-pad the last body frame to its full chunk capacity. This outer padding is
+ignored during recovery. Saved-FFV1 verification requires exact bytes before RS
+repair, including all header copies, their frame padding, body parity, and final
+frame padding. Frame allocation is shared through `core/layout.py`.
+
+The decoder reports corrected byte counts, recoverable header copies, and erasure
+fallback usage. Truncation, unsupported metadata, uncorrectable data, ambiguity,
+and failed integrity checks prevent output. Interleaving does not address frame
+drops, resizing, cropping, or reordered frames.
