@@ -29,6 +29,7 @@ core/
     ndca.py             # Wavelet/SVD embedding, costs, and trellis coding
     video_io.py         # YUV planes, video frames, and timestamps
     video_stego.py      # Per-frame capacity, embedding, and extraction
+    parallel.py         # Ordered per-frame work across CPU cores
 video_encode.py         # Hide a file in a video
 video_decode.py         # Recover a hidden file
 video_capacity.py       # Calculate maximum file size
@@ -45,6 +46,10 @@ Create `materials/` if needed and place your own input video and payload there; 
 Encoding, saved-video verification, and decoding print progress to stderr roughly
 every five seconds as frames finish, showing frame counts, byte progress, and
 elapsed time. Each stage also reports when it starts and completes.
+
+Frames are embedded, verified, and extracted on all CPU cores by default. Pass
+`--workers N` to `video_encode.py` or `video_decode.py` to limit this, or
+`--workers 1` to run everything in a single process.
 
 ### Check capacity
 

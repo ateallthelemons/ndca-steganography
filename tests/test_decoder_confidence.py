@@ -82,7 +82,7 @@ class ConfidenceDecoderTests(unittest.TestCase):
             for weak in range(n):
                 coefficients = np.full(n, 10.0*profile.delta)
                 coefficients[weak] += .49*profile.delta
-                with patch('core.video_stego.get_coefficient', side_effect=coefficients):
+                with patch('core.video_stego.get_coefficients', return_value=coefficients):
                     data, confidence = extract_chunk_with_confidence(np.zeros(shape), profile)
                 expected = np.where(H[:, weak], .01*profile.delta, .5*profile.delta)
                 np.testing.assert_allclose(confidence, expected.reshape(-1, 8).min(axis=1))

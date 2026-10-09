@@ -53,6 +53,64 @@ def modify_coefficient(block, value):
 
     return pywt.idwt2((modified_LL, details), WAVELET)
 
+# Batched Haar/SVD helpers. Each repeats pywt's and LAPACK's per-block arithmetic
+# in the same order, so results are bit-identical to the single-block functions
+# above. Inputs are stacks of blocks with shape (..., BLOCK_SIZE, BLOCK_SIZE).
+HAAR = np.sqrt(0.5)
+
+
+def image_blocks(image):
+    """View an image as a (rows, cols, BLOCK_SIZE, BLOCK_SIZE) grid of blocks."""
+    rows = image.shape[0] // BLOCK_SIZE
+    cols = image.shape[1] // BLOCK_SIZE
+    grid = image[:rows * BLOCK_SIZE, :cols * BLOCK_SIZE]
+    return grid.reshape(rows, BLOCK_SIZE, cols, BLOCK_SIZE).swapaxes(1, 2)
+
+
+def _analysis(x, axis):
+    even = np.take(x, np.arange(0, x.shape[axis], 2), axis)
+    odd = np.take(x, np.arange(1, x.shape[axis], 2), axis)
+    return even * HAAR + odd * HAAR, even * HAAR - odd * HAAR
+
+
+def _synthesis(approx, detail, axis):
+    shape = list(approx.shape)
+    shape[axis] *= 2
+    out = np.empty(shape)
+    even = [slice(None)] * approx.ndim
+    odd = list(even)
+    even[axis] = slice(0, None, 2)
+    odd[axis] = slice(1, None, 2)
+    out[tuple(even)] = approx * HAAR + detail * HAAR
+    out[tuple(odd)] = approx * HAAR + detail * -HAAR
+    return out
+
+
+def haar_dwt2(blocks):
+    """Batched pywt.dwt2(block, 'haar')."""
+    low, high = _analysis(blocks, -2)
+    LL, cV = _analysis(low, -1)
+    cH, cD = _analysis(high, -1)
+    return LL, (cH, cV, cD)
+
+
+def haar_idwt2(LL, details):
+    """Batched pywt.idwt2((LL, details), 'haar')."""
+    cH, cV, cD = details
+    return _synthesis(_synthesis(LL, cV, -1), _synthesis(cH, cD, -1), -2)
+
+
+def get_coefficients(blocks):
+    """Batched get_coefficient."""
+    LL, _ = haar_dwt2(blocks)
+    return np.linalg.svd(LL, compute_uv=False)[..., 0]
+
+
+def decode_bits(values, delta=DELTA):
+    """Batched decode_bit."""
+    return (np.rint(np.asarray(values) / delta).astype(np.int64) % 2).astype(np.uint8)
+
+
 def cost_factor(normalized, model):
     if model == 'crf':
         return 1 - normalized + 1e-6
@@ -67,28 +125,15 @@ def calculate_costs(image, delta=DELTA, model='crf', return_factor=False):
     rows = height // BLOCK_SIZE
     cols = width // BLOCK_SIZE
 
-    coefficients = np.zeros((rows, cols))
+    blocks = image_blocks(image)
+    coefficients = get_coefficients(blocks)
+
+    upper = np.mean(np.abs(blocks[1:] - blocks[:-1]), axis=(2, 3))
+    left = np.mean(np.abs(blocks[:, 1:] - blocks[:, :-1]), axis=(2, 3))
     differences = np.full((rows, cols), np.nan)
-
-    for r in range(rows):
-        for c in range(cols):
-            y = r * BLOCK_SIZE
-            x = c * BLOCK_SIZE
-            block = image[y:y+BLOCK_SIZE, x:x+BLOCK_SIZE]
-
-            coefficients[r, c] = get_coefficient(block)
-            neighbors = []
-
-            if r > 0:
-                upper = image[y-BLOCK_SIZE:y, x:x+BLOCK_SIZE]
-                neighbors.append(np.mean(np.abs(block - upper)))
-
-            if c > 0:
-                left = image[y:y+BLOCK_SIZE, x-BLOCK_SIZE:x]
-                neighbors.append(np.mean(np.abs(block - left)))
-
-            if neighbors:
-                differences[r, c] = np.mean(neighbors)
+    differences[1:, 0] = upper[:, 0]
+    differences[0, 1:] = left[0, :]
+    differences[1:, 1:] = (upper[:, 1:] + left[1:, :]) / 2
 
     valid = np.isfinite(differences)
     minimum = np.min(differences[valid])

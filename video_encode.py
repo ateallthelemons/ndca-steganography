@@ -9,25 +9,46 @@ from core.ndca import EmbeddingError
 from core.framing import MAX_PAYLOAD_BYTES, pack_message, require_embedding_profile
 from core.profiles import LEGACY, get_profile, add_profile_arguments, profile_from_args
 from core.layout import frame_chunk
+from core.parallel import default_workers, ordered_map
 from core.progress import Progress
 from core.video_io import unpack_video_frame, make_video_frame, rescale, video_frames
 from core.video_stego import chunk_size, embed_chunk, extract_chunk
 
+def embed_frame(U, part, profile, number):
+    """Embed one frame's chunk; runs in a worker process."""
+    try:
+        U, _ = embed_chunk(U, part) if profile == LEGACY else embed_chunk(U, part, profile)
+        return U
+    except EmbeddingError as error:
+        raise EmbeddingError(f'Embedding failed at frame {number}: {error}') from error
+
+
 def verify_saved_video(filename, message, dimensions, expected_frames, profile=LEGACY,
-                       *, progress=False):
+                       *, progress=False, workers=None):
     """Read the closed file and compare all embedded bytes, including padding."""
+    status = Progress('Verifying saved video', enabled=progress)
+
+    def tasks():
+        planned = 0
+        for index, (Y, U, _) in enumerate(video_frames(filename)):
+            if (Y.shape[1], Y.shape[0]) != dimensions:
+                raise EmbeddingError(f'Saved video dimensions changed at frame {index + 1}')
+            if planned < len(message):
+                plan = frame_chunk(U.shape, len(message), index, profile)
+                expected = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
+                planned += plan.length
+                yield extract_chunk, (U, plan.profile), (plan.length, expected)
+            else:
+                yield None, (), (0, None)
+
     total = 0
     frames = 0
-    status = Progress('Verifying saved video', enabled=progress)
-    for frames, (Y, U, _) in enumerate(video_frames(filename), start=1):
-        if (Y.shape[1], Y.shape[0]) != dimensions:
-            raise EmbeddingError(f'Saved video dimensions changed at frame {frames}')
-        if total < len(message):
-            plan = frame_chunk(U.shape, len(message), frames - 1, profile)
-            expected = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
-            if extract_chunk(U, plan.profile) != expected:
+    for (length, expected), extracted in ordered_map(tasks(), workers):
+        frames += 1
+        if expected is not None:
+            if extracted != expected:
                 raise EmbeddingError(f'Saved FFV1 verification failed at frame {frames}')
-            total += plan.length
+            total += length
         status.update(frames, f'{expected_frames} frames expected; {total}/{len(message)} message bytes checked')
     if total != len(message):
         raise EmbeddingError(f'Saved video ended after {total} of {len(message)} message bytes')
@@ -44,7 +65,7 @@ def check_output_path(destination, *sources):
             raise ValueError('Output must not alias the input video or payload')
 
 
-def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True):
+def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True, workers=None):
     require_embedding_profile()
     profile = get_profile(profile)
     destination = Path(output_name)
@@ -85,42 +106,48 @@ def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True):
                 audio_map[stream.index] = target.add_stream_from_template(stream)
 
             selected = [input_video, *source.streams.audio]
-            for packet in source.demux(selected):
-                if packet.stream.type == 'audio':
-                    if packet.dts is None:
+            time_base = output_video.codec_context.time_base
+
+            def tasks():
+                """Mux audio as it arrives; describe each video frame's embedding work."""
+                nonlocal total
+                index = 0
+                for packet in source.demux(selected):
+                    if packet.stream.type == 'audio':
+                        if packet.dts is None:
+                            continue
+                        packet.stream = audio_map[packet.stream.index]
+                        target.mux(packet)
                         continue
-                    packet.stream = audio_map[packet.stream.index]
-                    target.mux(packet)
-                    continue
 
-                for frame in packet.decode():
-                    if (frame.width, frame.height) != dimensions:
-                        raise ValueError('Midstream resolution changes are not supported')
-                    Y, U, V = unpack_video_frame(frame)
-                    size = chunk_size(U.shape, profile)
-                    if not size:
-                        raise ValueError('Video too small: no available U-plane payload capacity')
-                    if frames == 0:
-                        print(f'Frame size: {frame.width}x{frame.height}, body: {size} bytes/frame, profile: {profile.name}')
+                    for frame in packet.decode():
+                        if (frame.width, frame.height) != dimensions:
+                            raise ValueError('Midstream resolution changes are not supported')
+                        Y, U, V = unpack_video_frame(frame)
+                        size = chunk_size(U.shape, profile)
+                        if not size:
+                            raise ValueError('Video too small: no available U-plane payload capacity')
+                        if index == 0:
+                            print(f'Frame size: {frame.width}x{frame.height}, body: {size} bytes/frame, profile: {profile.name}')
+                        if frame.pts is None or frame.time_base is None:
+                            raise ValueError('Input video frame has no usable timestamp')
+                        pts = rescale(frame.pts, frame.time_base, time_base)
 
-                    if total < len(message):
-                        plan = frame_chunk(U.shape, len(message), frames, profile)
-                        part = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
-                        try:
-                            U, _ = (embed_chunk(U, part) if plan.profile == LEGACY
-                                    else embed_chunk(U, part, plan.profile))
-                        except EmbeddingError as error:
-                            raise EmbeddingError(f'Embedding failed at frame {frames + 1}: {error}') from error
-                        total += plan.length
+                        function, args = None, ()
+                        if total < len(message):
+                            plan = frame_chunk(U.shape, len(message), index, profile)
+                            part = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
+                            function, args = embed_frame, (U, part, plan.profile, index + 1)
+                            total += plan.length
+                        yield function, args, (Y, U, V, pts)
+                        index += 1
 
-                    if frame.pts is None or frame.time_base is None:
-                        raise ValueError('Input video frame has no usable timestamp')
-                    pts = rescale(frame.pts, frame.time_base, output_video.codec_context.time_base)
-                    encoded = make_video_frame(Y, U, V, pts, output_video.codec_context.time_base)
-                    for out_packet in output_video.encode(encoded):
-                        target.mux(out_packet)
-                    frames += 1
-                    status.update(frames, f'{total}/{len(message)} message bytes embedded')
+            for (Y, U, V, pts), embedded in ordered_map(tasks(), workers):
+                encoded = make_video_frame(Y, U if embedded is None else embedded, V, pts, time_base)
+                for out_packet in output_video.encode(encoded):
+                    target.mux(out_packet)
+                frames += 1
+                status.update(frames, f'{frames} frames written')
 
             if total != len(message):
                 raise ValueError(f'Video too short: embedded {total} of {len(message)} bytes')
@@ -128,7 +155,7 @@ def encode(input_name, output_name, payload, profile=LEGACY, *, progress=True):
                 target.mux(out_packet)
         status.update(frames, f'{total}/{len(message)} message bytes embedded', final=True)
         verify_saved_video(str(temporary_path), message, dimensions, frames, profile,
-                           progress=progress)
+                           progress=progress, workers=workers)
         temporary_path.replace(destination)
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -142,9 +169,11 @@ if __name__ == '__main__':
     parser.add_argument('payload', help='File to hide')
     parser.add_argument('output', help='Output MKV file')
     add_profile_arguments(parser)
+    parser.add_argument('--workers', type=int, default=default_workers(),
+                        help='CPU processes for per-frame work (default: all cores; 1 disables)')
     args = parser.parse_args()
     try:
         profile = profile_from_args(args)
     except ValueError as error:
         parser.error(str(error))
-    encode(args.input, args.output, args.payload, profile)
+    encode(args.input, args.output, args.payload, profile, workers=args.workers)
