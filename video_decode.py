@@ -5,28 +5,28 @@ from pathlib import Path
 
 from core.ecc import UncorrectableBodyError
 from core.framing import MessageReader
-from core.config import HEADER_COPIES
+from core.config import HEADER_COPIES, PROFILES, add_profile_argument
 from core.parallel import default_workers, ordered_map
 from core.progress import Progress
 from core.video_io import video_frames
 from core.video_stego import extract_chunk_with_confidence
 
 
-def recover(filename, *, progress=False, workers=None):
+def recover(filename, *, settings, progress=False, workers=None):
     """Extract, repair, and validate a file without writing to the filesystem."""
     try:
-        return _recover(filename, progress=progress, workers=workers)
+        return _recover(filename, settings=settings, progress=progress, workers=workers)
     except UncorrectableBodyError:
         # One bounded retry. Do not retry ambiguous repairs, CRC/padding errors,
         # invalid headers, truncated input or I/O errors. Re-read rather than
         # retaining a second score array for every otherwise successful file.
         pass
-    result = _recover(filename, progress=progress, workers=workers,
+    result = _recover(filename, settings=settings, progress=progress, workers=workers,
                       confidence_model='likelihood')
     return replace(result, confidence_model='likelihood')
 
 
-def _recover(filename, *, progress=False, workers=None, confidence_model='minimum'):
+def _recover(filename, *, settings, progress=False, workers=None, confidence_model='minimum'):
     reader = MessageReader()
     label = 'Decoding' if confidence_model == 'minimum' else 'Retrying with likelihood confidence'
     status = Progress(label, enabled=progress)
@@ -36,7 +36,7 @@ def _recover(filename, *, progress=False, workers=None, confidence_model='minimu
     # Read all independently padded header groups before processing the body.
     for U in planes:
         frames += 1
-        result = reader.feed_frame(U, confidence_model=confidence_model)
+        result = reader.feed_frame(U, settings, confidence_model=confidence_model)
         status.update(frames, f'{len(reader.received)} encoded bytes read',
                       final=result is not None)
         if result is not None:
@@ -45,7 +45,7 @@ def _recover(filename, *, progress=False, workers=None, confidence_model='minimu
             break
 
     if reader.header is not None:
-        extract = partial(extract_chunk_with_confidence, model=confidence_model)
+        extract = partial(extract_chunk_with_confidence, settings=settings, model=confidence_model)
         tasks = ((extract, (U,), None) for U in planes)
         results = ordered_map(tasks, workers)
         try:
@@ -64,8 +64,8 @@ def _recover(filename, *, progress=False, workers=None, confidence_model='minimu
     return result
 
 
-def decode(filename, output=None, *, progress=True, workers=None):
-    result = recover(filename, progress=progress, workers=workers)
+def decode(filename, output=None, *, settings, progress=True, workers=None):
+    result = recover(filename, settings=settings, progress=progress, workers=workers)
     destination = Path(output) if output is not None else Path.cwd()
     restore_name = output is None or destination.is_dir()
     if restore_name:
@@ -93,5 +93,6 @@ if __name__ == '__main__':
                         help='Output file or existing directory (default: stored filename in current directory)')
     parser.add_argument('--workers', type=int, default=default_workers(),
                         help='CPU processes for per-frame work (default: all cores; 1 disables)')
+    add_profile_argument(parser)
     args = parser.parse_args()
-    decode(args.input, args.output, workers=args.workers)
+    decode(args.input, args.output, settings=PROFILES[args.profile], workers=args.workers)

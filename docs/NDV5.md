@@ -6,7 +6,8 @@ most-significant first. Lengths are in bytes. The file tools use only this mappi
 ## Physical mapping
 
 Header and body use the 8-bit YUV420p U plane, Haar DWT on 16×16 blocks, the largest
-LL singular value, rounded quantization parity at delta 80, and height-three matrix
+LL singular value, rounded quantization parity at the explicitly selected delta
+(`base`: 80; `robust`: 120), and height-three matrix
 STC at rate 1/2. Column masks are `(7, 5)`, low bit first. For message row r,
 carrier `2*r+j` contributes bit t of mask j to syndrome row r+t when that row
 exists. Columns truncate at the final row. Initial and terminal trellis states are
@@ -14,7 +15,11 @@ zero; there are no extra tail carriers. Extraction is `H y mod 2`.
 
 For B full blocks, each frame holds S = floor((B-1)/16) bytes. Choose exactly
 16*S carriers using `np.linspace(1, B-1, 16*S, dtype=int)`. Block zero is excluded.
-These settings are known before decoding metadata; no guessed mapping is accepted.
+These settings must be supplied before decoding metadata; no guessed mapping is accepted.
+The profile name/delta is not encoded in the bootstrap. Both supported profiles
+retain embedding ID 14 and identical framing for compatibility with tested files.
+The caller must retain the profile separately and use it for both encoding and
+decoding; ID 14 alone does not distinguish the two strengths.
 
 ## Header groups
 
@@ -65,8 +70,8 @@ decisions, RS parameters, 1–32 erasure trials per failed word, and ambiguity a
 integrity checks. The alternative score uses a Gaussian lattice model with fixed
 sigma=delta/2, propagates carrier reliability through the STC XOR supports, and
 multiplies approximate bit reliabilities within each byte. It is a heuristic
-ranking, not a calibrated probability. Details and evidence are in
-[confidence recovery](DECODER_CONFIDENCE.md). Byte-only readers retain their
+ranking, not a calibrated probability. The selected delta is used in both passes.
+Byte-only readers retain their
 existing behavior; the video-level retry requires re-reading received pixels.
 
 ## Bootstrap

@@ -1,4 +1,4 @@
-"""Current file mapping and reusable numerical settings."""
+"""File mapping and explicitly selected embedding profiles."""
 from dataclasses import dataclass
 from math import isfinite
 
@@ -10,10 +10,10 @@ HEADER_COPIES = 3
 
 @dataclass(frozen=True)
 class Settings:
-    """Numerical options for local experiments; file tools use CURRENT only."""
-    width: int = 2
-    delta: int = 80
-    cost: str = 'crf'
+    """Immutable numerical settings passed explicitly through the pipeline."""
+    width: int
+    delta: int
+    cost: str
 
     def __post_init__(self):
         if (type(self.width) is not int or self.width not in (2, 3)
@@ -22,4 +22,12 @@ class Settings:
             raise ValueError('Invalid embedding settings')
 
 
-CURRENT = Settings()
+PROFILES = {
+    'base': Settings(width=2, delta=80, cost='crf'),
+    'robust': Settings(width=2, delta=120, cost='crf'),
+}
+
+
+def add_profile_argument(parser):
+    parser.add_argument('--profile', required=True, choices=tuple(PROFILES),
+                        help='Embedding profile; use the same profile to encode and decode')

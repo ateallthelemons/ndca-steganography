@@ -1,5 +1,5 @@
 import numpy as np
-from .config import BLOCK_SIZE, CURRENT
+from .config import BLOCK_SIZE
 from . import stc
 from .ndca import (
     EmbeddingError, get_positions, calculate_costs,
@@ -54,13 +54,13 @@ def reconstruct_carriers(blocks, coefficients, delta):
     return chosen_pixels, movement, found
 
 
-def chunk_size(shape, settings=CURRENT):
+def chunk_size(shape, settings):
     height, width = shape
     blocks = (height // BLOCK_SIZE) * (width // BLOCK_SIZE)
     return max(0, (blocks - 1) // (8 * settings.width))
 
 
-def embed_chunk(U, data, settings=CURRENT):
+def embed_chunk(U, data, settings):
     if len(data) != chunk_size(U.shape, settings) or not data:
         raise ValueError('Invalid chunk size for this frame')
 
@@ -97,18 +97,18 @@ def embed_chunk(U, data, settings=CURRENT):
     return result, cost
 
 
-def extract_chunk(U, settings=CURRENT):
+def extract_chunk(U, settings):
     return _extract_chunk(U, settings, with_confidence=False)
 
 
-def extract_chunk_with_confidence(U, settings=CURRENT, *, model='minimum'):
+def extract_chunk_with_confidence(U, settings, *, model='minimum'):
     """Return unchanged bytes and receiver-only byte reliability scores."""
     if model not in ('minimum', 'likelihood'):
         raise ValueError('Unknown confidence model')
     return _extract_chunk(U, settings, with_confidence=True, model=model)
 
 
-def likelihood_byte_confidence(coefficients, settings=CURRENT):
+def likelihood_byte_confidence(coefficients, settings):
     """Approximate byte reliability under a Gaussian quantization-lattice model.
 
     Use a fixed sigma=delta/2, a uniform lattice prior and nine nearby centers.

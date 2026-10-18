@@ -182,15 +182,15 @@ class MessageReader:
             raise ValueError('Video ended before a complete payload was recovered')
         return self.result
 
-    def feed_frame(self, plane, *, confidence_model='minimum'):
+    def feed_frame(self, plane, settings, *, confidence_model='minimum'):
         """Discard spare slots independently at the end of each header group."""
         from .video_stego import extract_chunk_with_confidence
         from .layout import frame_chunk
         if self.result is not None:
             return self.result
-        chunk, confidence = extract_chunk_with_confidence(plane, model=confidence_model)
+        chunk, confidence = extract_chunk_with_confidence(plane, settings, model=confidence_model)
         if self.header is None:
-            plan = frame_chunk(plane.shape, self.bootstrap_size, self.frames)
+            plan = frame_chunk(plane.shape, self.bootstrap_size, self.frames, settings)
             chunk, confidence = chunk[:plan.length], confidence[:plan.length]
         self.frames += 1
         return self.feed(chunk, confidence=confidence)

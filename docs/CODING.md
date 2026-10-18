@@ -1,6 +1,7 @@
 # Coding implementation
 
-The file pipeline uses height-three matrix STC at rate 1/2, delta 80, CRF costs,
+The file pipeline uses height-three matrix STC at rate 1/2, profile-selected delta
+(80 for `base`, 120 for `robust`), CRF costs,
 and the physical mapping specified in [NDV5](NDV5.md).
 
 ## Matrix STC
@@ -13,8 +14,9 @@ truncates columns at the last row. There are no termination carriers.
 
 The general engine retains both column-mask definitions: `(7, 5)` for rate 1/2
 and `(7, 5, 3)` for rate 1/3. `Settings` in `core/config.py` supplies explicit width,
-delta, and cost inputs to numerical functions. File tools use `CURRENT` only;
-these internal options do not constitute supported alternate file formats.
+delta, and cost inputs to numerical functions. File tools require `--profile base`
+or `--profile robust` and pass immutable settings explicitly, including into worker processes. There is no global default.
+Other numerical combinations remain experimental rather than supported profiles.
 Changes to extraction settings must agree between encoder and decoder.
 
 STC minimizes embedding cost; RS repairs channel errors. The matrix implementation

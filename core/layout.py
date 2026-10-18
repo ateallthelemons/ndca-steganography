@@ -13,31 +13,31 @@ class FrameChunk:
     size: int
 
 
-def bootstrap_copy_frames(shape):
-    size = chunk_size(shape)
+def bootstrap_copy_frames(shape, settings):
+    size = chunk_size(shape, settings)
     if not size:
         raise ValueError('Video too small for embedding')
     return (HEADER_SIZE + size - 1) // size
 
 
-def bootstrap_frames(shape):
-    return HEADER_COPIES * bootstrap_copy_frames(shape)
+def bootstrap_frames(shape, settings):
+    return HEADER_COPIES * bootstrap_copy_frames(shape, settings)
 
 
-def message_capacity(shape, frames):
-    count = bootstrap_frames(shape)
+def message_capacity(shape, frames, settings):
+    count = bootstrap_frames(shape, settings)
     if frames < count:
         return 0
-    return HEADER_SIZE * HEADER_COPIES + (frames - count) * chunk_size(shape)
+    return HEADER_SIZE * HEADER_COPIES + (frames - count) * chunk_size(shape, settings)
 
 
-def frame_chunk(shape, message_length, frame_index):
+def frame_chunk(shape, message_length, frame_index, settings):
     if frame_index < 0 or message_length < 0:
         raise ValueError('Invalid frame index or message length')
-    count = bootstrap_frames(shape)
-    size = chunk_size(shape)
+    count = bootstrap_frames(shape, settings)
+    size = chunk_size(shape, settings)
     if frame_index < count:
-        copy_index, local_frame = divmod(frame_index, bootstrap_copy_frames(shape))
+        copy_index, local_frame = divmod(frame_index, bootstrap_copy_frames(shape, settings))
         offset = copy_index * HEADER_SIZE + local_frame * size
         boundary = min((copy_index + 1) * HEADER_SIZE, message_length)
     else:

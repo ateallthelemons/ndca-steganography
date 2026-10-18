@@ -1,12 +1,12 @@
 import numpy as np
-from .config import BLOCK_SIZE, CURRENT
+from .config import BLOCK_SIZE
 
 
 class EmbeddingError(ValueError):
     """The requested data could not be embedded and verified reliably."""
 
 
-def get_positions(shape, message_bits, carriers_per_bit=CURRENT.width):
+def get_positions(shape, message_bits, carriers_per_bit):
     height, width = shape
     rows = height // BLOCK_SIZE
     cols = width // BLOCK_SIZE
@@ -69,7 +69,7 @@ def get_coefficients(blocks):
     return np.linalg.svd(LL, compute_uv=False)[..., 0]
 
 
-def decode_bits(values, delta=CURRENT.delta):
+def decode_bits(values, delta):
     """Extract quantization parity for a batch of coefficients."""
     return (np.rint(np.asarray(values) / delta).astype(np.int64) % 2).astype(np.uint8)
 
@@ -82,7 +82,7 @@ def cost_factor(normalized, model):
     raise ValueError('Unknown cost model')
 
 
-def calculate_costs(image, model=CURRENT.cost):
+def calculate_costs(image, model):
     """Return LL coefficients and normalized neighbor-cost factors."""
     image = np.asarray(image, dtype=np.float64)
     height, width = image.shape

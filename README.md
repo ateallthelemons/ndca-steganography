@@ -1,14 +1,9 @@
 # NDCA Steganography
 
 Hide a file in a video's U chroma plane and recover its bytes and original filename.
-The tool uses one NDV5 pipeline: Haar/LL-SVD, height-three matrix STC at rate 1/2,
-delta 80, CRF costs, repeated protected headers, and confidence-guided Reed–Solomon
-recovery. It targets resilience to YouTube recompression.
-
-The current decoder recovered a complete 48,485-byte file from one tested YouTube
-H.264 rendition. The AV1 rendition failed. This is a demonstrated recovery, not a
-general reliability guarantee. Resizing, cropping, trimming, or changing frame
-alignment can prevent recovery.
+Choose an embedding profile for every command: `base` uses lower strength and
+`robust` trades more visible chroma changes for better recovery through recompression.
+There is no default profile.
 
 ## Setup
 
@@ -21,15 +16,30 @@ python -m pip install -r requirements.txt
 On Windows, activate with `.venv\Scripts\activate`. Runtime dependencies are
 PyAV, NumPy, and reedsolo. Run commands from the project root.
 
+## Profiles
+
+| Profile | Strength (delta) | Tradeoff | Exact recovery in our YouTube H.264 tests |
+| --- | ---: | --- | --- |
+| `base` | 80 | Less visible modification; lower robustness | 10/14 |
+| `robust` | 120 | Stronger, more visible modification | 14/15 |
+
+These are small test sets, not guaranteed success rates. The sets differ:
+TunnelFlag was absent from the base screen and failed in the robust test.
+Both profiles use the same payload capacity, NDV5 framing, STC, and error correction.
+Neither profile guarantees imperceptibility or recovery from other renditions.
+
+Use **the same profile to encode and decode**. The profile is not auto-detected or stored as a distinct profile name in the header; retain it alongside the video.
+
 ## Usage
 
 ```bash
-python video_capacity.py input.mp4 --filename message.txt
-python video_encode.py input.mp4 message.txt encoded.mkv
-python video_decode.py encoded.mkv recovered.txt
+python video_capacity.py input.mp4 --filename message.txt --profile robust
+python video_encode.py input.mp4 message.txt encoded.mkv --profile robust
+python video_decode.py encoded.mkv recovered.txt --profile robust
 ```
 
-No profile flags are needed. The capacity command scans all frames and includes
+`--profile base` or `--profile robust` is required, including for capacity checks.
+The capacity command scans all frames and includes
 filename, checksums, RS parity, repeated headers, and frame padding. Without
 `--filename` it reports an upper bound for a one-byte filename. Capacity does not
 guarantee that every cover can embed successfully or survive recompression.
@@ -70,35 +80,17 @@ are rejected before writing a recovered file.
 If the existing video decoder cannot repair a body word, it makes one additional
 pass with a likelihood-based confidence ranking. Successful first-pass results
 are returned immediately. This receiver-only fallback preserves NDV5 files and
-payload capacity; see [confidence recovery](docs/DECODER_CONFIDENCE.md) for the
-model, validation and limits.
+payload capacity; see [NDV5 confidence recovery](docs/NDV5.md)
+for the model and limits.
 
 See [coding](docs/CODING.md), [NDV5 format](docs/NDV5.md), and
 [parallel processing](docs/PARALLEL.md) for implementation details.
 
-## Structure
-
-```text
-core/config.py        Current file mapping and internal numerical settings
-core/ndca.py          Batched Haar/SVD, carrier positions, neighbor costs
-core/stc.py           General height-three matrix STC
-core/video_stego.py   Reconstruction, embedding, extraction, confidence
-core/ecc.py           Reed–Solomon and interleaving
-core/framing.py       Protected metadata, integrity, incremental reader
-core/layout.py        Shared header/body frame allocation
-core/video_io.py      YUV planes and timestamps
-core/parallel.py      Ordered, bounded per-frame multiprocessing
-core/progress.py      Progress reporting
-video_encode.py       Encode and verify a file
-video_decode.py       Recover a file
-video_capacity.py     Calculate exact file capacity
-```
-
 ## Limits
 
 - Recovery depends on the transcoding conditions. The tested YouTube H.264
-  rendition recovered exactly; AV1 did not. Resizing, cropping, and dropped or
-  duplicated frames can disrupt carrier alignment, which the current decoder
+  results above do not establish VP9/AV1 support across covers. Resizing, cropping,
+  and dropped or duplicated frames can disrupt carrier alignment, which the current decoder
   does not restore.
 - Files are limited to 256 MiB because messages are buffered in memory.
 - Inputs need even dimensions, sufficient U-plane capacity, and usable timestamps.
@@ -107,6 +99,17 @@ video_capacity.py     Calculate exact file capacity
   Subtitles, other video streams, and full color metadata are not preserved.
 - Filenames and payloads are neither compressed nor encrypted. CRC32 detects
   accidental corruption; it is not authentication.
+
+## Development
+
+Planned: a `stealth` mode combining lower embedding strength with a smaller useful
+payload and redundancy distributed across the video. It is not implemented or an
+accepted profile name. Start with fixed spreading and error correction across
+separated frames, then assess confidence-aware recovery. Nearby repeated copies
+may suffer the same damage. Merely supplying a smaller file currently stops
+embedding earlier; it does not add protection. Any new coding/layout needs an
+explicit format version and matching decoder. Compare visual quality and exact
+recovery against both existing profiles before promoting it.
 
 ## Reference
 

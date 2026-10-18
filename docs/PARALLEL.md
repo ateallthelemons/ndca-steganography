@@ -12,3 +12,7 @@ closes the result iterator and shuts down the pool; worker errors propagate.
 `--workers N` controls processes for encode/decode. The default uses all CPU cores;
 `--workers 1` runs inline. Batched Haar/SVD processing within each frame is retained
 in either mode. Worker count does not change the embedding mathematics or mapping.
+
+The explicitly selected profile settings travel with each worker task (or bound
+extraction function), including saved-file verification and likelihood retries.
+Workers do not infer a profile from process-global defaults.
