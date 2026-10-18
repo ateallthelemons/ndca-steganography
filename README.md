@@ -28,6 +28,13 @@ TunnelFlag was absent from the base screen and failed in the robust test.
 Both profiles use the same payload capacity, NDV5 framing, STC, and error correction.
 Neither profile guarantees imperceptibility or recovery from other renditions.
 
+![DrivingPOV frame comparison: prepared cover, delta80, delta100, and delta120. Stronger embedding produces more visible colored blocks on the road and sky.](readme-pics/delta-comparison-drivingpov.png)
+
+*Same frame before YouTube recompression: original cover, `base` (delta80),
+experimental delta100, and `robust` (delta120). Open the image at full size to
+inspect the road and sky. Delta100 is shown for comparison; it is not a supported
+profile. Source footage: Netflix DrivingPOV; [image details](readme-pics/README.md).*
+
 Use **the same profile to encode and decode**. The profile is not auto-detected or stored as a distinct profile name in the header; retain it alongside the video.
 
 ## Usage
