@@ -16,6 +16,3 @@ Source footage: **Netflix, DrivingPOV**, obtained from the
 The source was resized/cropped and converted to 720p30 YUV420p for testing;
 the three encoded variants additionally modify the U chroma plane.
 See [Netflix Open Content](https://opencontent.netflix.com/) for source information.
-
-The original experiment artifacts remain locally ignored under `materials/`.
-This directory contains only the selected images and credits used by the public README.
