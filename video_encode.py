@@ -1,4 +1,5 @@
 import argparse
+import os
 import tempfile
 from fractions import Fraction
 from pathlib import Path
@@ -7,7 +8,7 @@ import av
 
 from core.config import PROFILES, add_profile_argument
 from core.ndca import EmbeddingError
-from core.framing import MAX_PAYLOAD_BYTES, pack_message
+from core.framing import MessageWriter
 from core.layout import frame_chunk
 from core.parallel import default_workers, ordered_map
 from core.progress import Progress
@@ -27,6 +28,7 @@ def verify_saved_video(filename, message, dimensions, expected_frames,
                        *, settings, progress=False, workers=None):
     """Read the closed file and compare all embedded bytes, including padding."""
     status = Progress('Verifying saved video', enabled=progress)
+    message.rewind()
 
     def tasks():
         planned = 0
@@ -35,7 +37,7 @@ def verify_saved_video(filename, message, dimensions, expected_frames,
                 raise EmbeddingError(f'Saved video dimensions changed at frame {index + 1}')
             if planned < len(message):
                 plan = frame_chunk(U.shape, len(message), index, settings)
-                expected = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
+                expected = message.read(plan.length).ljust(plan.size, b'\0')
                 planned += plan.length
                 yield extract_chunk, (U, settings), (plan.length, expected)
             else:
@@ -69,10 +71,14 @@ def encode(input_name, output_name, payload, *, settings, progress=True, workers
     destination = Path(output_name)
     payload_path = Path(payload)
     check_output_path(destination, input_name, payload_path)
-    if payload_path.stat().st_size > MAX_PAYLOAD_BYTES:
-        raise ValueError(f'Payload exceeds supported limit of {MAX_PAYLOAD_BYTES} bytes')
-    data = payload_path.read_bytes()
-    message = pack_message(payload_path.name, data)
+    with payload_path.open('rb') as source:
+        message = MessageWriter(payload_path.name, source, os.fstat(source.fileno()).st_size)
+        _encode(input_name, output_name, message, settings=settings,
+                progress=progress, workers=workers)
+
+
+def _encode(input_name, output_name, message, *, settings, progress, workers):
+    destination = Path(output_name)
     status = Progress('Encoding', enabled=progress)
 
     total = 0
@@ -134,7 +140,7 @@ def encode(input_name, output_name, payload, *, settings, progress=True, workers
                         function, args = None, ()
                         if total < len(message):
                             plan = frame_chunk(U.shape, len(message), index, settings)
-                            part = message[plan.offset:plan.offset+plan.length].ljust(plan.size, b'\0')
+                            part = message.read(plan.length).ljust(plan.size, b'\0')
                             function, args = embed_frame, (U, part, index + 1, settings)
                             total += plan.length
                         yield function, args, (Y, U, V, pts)
@@ -158,7 +164,7 @@ def encode(input_name, output_name, payload, *, settings, progress=True, workers
     finally:
         temporary_path.unlink(missing_ok=True)
 
-    print(f'Saved and verified {output_name}: {frames} video frames, {len(data)} payload bytes')
+    print(f'Saved and verified {output_name}: {frames} video frames, {message.payload_length} payload bytes')
 
 
 if __name__ == '__main__':

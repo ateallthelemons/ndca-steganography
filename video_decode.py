@@ -1,4 +1,6 @@
 import argparse
+import os
+import tempfile
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -12,22 +14,29 @@ from core.video_io import video_frames
 from core.video_stego import extract_chunk_with_confidence
 
 
-def recover(filename, *, settings, progress=False, workers=None):
-    """Extract, repair, and validate a file without writing to the filesystem."""
+def recover(filename, *, sink, settings, progress=False, workers=None):
+    """Stream into a caller-owned seekable sink and return validated metadata.
+
+    Discard provisional sink bytes if recovery raises. A confidence retry resets
+    the sink to its initial position before writing the second attempt.
+    """
+    origin = sink.tell()
     try:
-        return _recover(filename, settings=settings, progress=progress, workers=workers)
+        return _recover(filename, settings=settings, progress=progress, workers=workers, sink=sink)
     except UncorrectableBodyError:
         # One bounded retry. Do not retry ambiguous repairs, CRC/padding errors,
         # invalid headers, truncated input or I/O errors. Re-read rather than
         # retaining a second score array for every otherwise successful file.
         pass
+    sink.seek(origin)
+    sink.truncate()
     result = _recover(filename, settings=settings, progress=progress, workers=workers,
-                      confidence_model='likelihood')
+                      confidence_model='likelihood', sink=sink)
     return replace(result, confidence_model='likelihood')
 
 
-def _recover(filename, *, settings, progress=False, workers=None, confidence_model='minimum'):
-    reader = MessageReader()
+def _recover(filename, *, sink, settings, progress=False, workers=None, confidence_model='minimum'):
+    reader = MessageReader(sink)
     label = 'Decoding' if confidence_model == 'minimum' else 'Retrying with likelihood confidence'
     status = Progress(label, enabled=progress)
     planes = (U for _, U, _ in video_frames(filename))
@@ -37,7 +46,7 @@ def _recover(filename, *, settings, progress=False, workers=None, confidence_mod
     for U in planes:
         frames += 1
         result = reader.feed_frame(U, settings, confidence_model=confidence_model)
-        status.update(frames, f'{len(reader.received)} encoded bytes read',
+        status.update(frames, f'{reader.bytes_received} encoded bytes read',
                       final=result is not None)
         if result is not None:
             return result
@@ -52,7 +61,7 @@ def _recover(filename, *, settings, progress=False, workers=None, confidence_mod
             for _, (chunk, confidence) in results:
                 frames += 1
                 result = reader.feed(chunk, confidence=confidence)
-                status.update(frames, f'{len(reader.received)} encoded bytes read',
+                status.update(frames, f'{reader.bytes_received} encoded bytes read',
                               final=result is not None)
                 if result is not None:
                     return result
@@ -60,30 +69,43 @@ def _recover(filename, *, settings, progress=False, workers=None, confidence_mod
             results.close()
 
     result = reader.finish()
-    status.update(frames, f'{len(reader.received)} encoded bytes read', final=True)
+    status.update(frames, f'{reader.bytes_received} encoded bytes read', final=True)
     return result
 
 
 def decode(filename, output=None, *, settings, progress=True, workers=None):
-    result = recover(filename, settings=settings, progress=progress, workers=workers)
     destination = Path(output) if output is not None else Path.cwd()
     restore_name = output is None or destination.is_dir()
-    if restore_name:
-        destination = destination / result.filename
-    # Nothing is written until both error correction and integrity checks pass.
-    with destination.open('xb' if restore_name else 'wb') as target:
-        target.write(result.payload)
-    print(f'Recovered {len(result.payload)} bytes into {destination} (NDV5)')
+    directory = destination if restore_name else destination.parent
+    # The temporary file is on the destination filesystem for atomic publication.
+    with tempfile.NamedTemporaryFile(prefix='.ndv5-', dir=directory, delete=False) as target:
+        temporary_path = Path(target.name)
+        try:
+            result = recover(filename, settings=settings, progress=progress,
+                             workers=workers, sink=target)
+            if restore_name:
+                destination = destination / result.filename
+            target.flush()
+            os.fsync(target.fileno())
+            target.close()
+            if restore_name:
+                # Atomic no-clobber publication for a stored filename.
+                os.link(temporary_path, destination)
+            else:
+                temporary_path.replace(destination)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    print(f'Recovered {result.payload_length} bytes into {destination} (NDV5)')
     print(f'Corrected bytes: bootstrap {result.header_corrections}, '
-          f'body {sum(result.body_corrections)} '
-          f'(maximum {max(result.body_corrections, default=0)} per codeword)')
+          f'body {result.body_correction_total} '
+          f'(maximum {result.body_correction_max} per codeword)')
     print(f'Recoverable header copies: {result.header_copies_recovered}/{HEADER_COPIES}')
     if result.confidence_model == 'likelihood':
         print('Recovered using likelihood-confidence fallback')
-    if any(result.body_erasures):
+    if result.body_erasure_words:
         print(f'Confidence-guided erasure repair: '
-              f'{sum(n > 0 for n in result.body_erasures)} body codewords; '
-              f'{sum(result.body_erasures)} byte positions marked unreliable')
+              f'{result.body_erasure_words} body codewords; '
+              f'{result.body_erasure_total} byte positions marked unreliable')
 
 
 if __name__ == '__main__':

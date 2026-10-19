@@ -99,7 +99,8 @@ See [coding](docs/CODING.md), [NDV5 format](docs/NDV5.md), and
   results above do not establish VP9/AV1 support across covers. Resizing, cropping,
   and dropped or duplicated frames can disrupt carrier alignment, which the current decoder
   does not restore.
-- Files are limited to 256 MiB because messages are buffered in memory.
+- CLI encoding and decoding stream RS groups with bounded memory; payload size
+  is limited by video capacity, disk space, and the NDV5 64-bit wire lengths.
 - Inputs need even dimensions, sufficient U-plane capacity, and usable timestamps.
   Midstream resolution changes are unsupported.
 - FFV1 output can be large. Conversion to 8-bit YUV420p can reduce source bit depth.

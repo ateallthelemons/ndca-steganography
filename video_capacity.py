@@ -5,7 +5,7 @@ import av
 
 from core.ecc import HEADER_SIZE
 from core.config import HEADER_COPIES, PROFILES, add_profile_argument
-from core.framing import filename_bytes, maximum_payload, MAX_PAYLOAD_BYTES
+from core.framing import filename_bytes, maximum_payload
 from core.video_stego import chunk_size
 from core.layout import message_capacity, bootstrap_frames
 
@@ -64,7 +64,6 @@ def main():
     print(f'Framed message capacity (excludes bootstrap-frame padding): {total:,} bytes')
     print(f'NDV5: {HEADER_COPIES} x {HEADER_SIZE}-byte protected bootstrap; '
           'RS(60,20) body, including filename and CRC32')
-    print(f'Payload implementation limit: {MAX_PAYLOAD_BYTES:,} bytes')
     if maximum < 0:
         print('No file fits: insufficient room for the header and filename, even with an empty payload.')
     elif name is not None:

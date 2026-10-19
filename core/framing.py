@@ -8,7 +8,8 @@ import zlib
 from .config import MAGIC, EMBEDDING_ID, HEADER_COPIES
 from .ecc import (
     BODY_DATA, BODY_SIZE, HEADER_SIZE, INTERLEAVE_DEPTH,
-    encode_header, decode_header, encode_body, decode_body,
+    encode_header, decode_header,
+    encode_body_group, decode_body_group,
 )
 
 # magic, embedding/ECC/depth/flags, payload length, filename length,
@@ -17,8 +18,8 @@ BOOTSTRAP = struct.Struct('>4sBBBBQHQ2sI')
 CRC = struct.Struct('>I')
 ECC_PROFILE = 1
 MAX_FILENAME_BYTES = 65535
-# Bound memory use before trusting metadata. This implementation buffers files.
-MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
+# Maximum imposed by the unsigned 64-bit encoded body length.
+MAX_PAYLOAD_BYTES = ((2**64 - 1) // BODY_SIZE) * BODY_DATA - 1 - CRC.size
 
 
 @dataclass(frozen=True)
@@ -37,12 +38,14 @@ class Header:
 @dataclass(frozen=True)
 class Recovery:
     filename: str
-    payload: bytes
+    payload_length: int
     header_corrections: int = 0
-    body_corrections: tuple = ()
     header_copies_recovered: int = 1
-    body_erasures: tuple = ()
     confidence_model: str = 'minimum'
+    body_correction_total: int = 0
+    body_correction_max: int = 0
+    body_erasure_total: int = 0
+    body_erasure_words: int = 0
 
 
 def filename_bytes(name):
@@ -64,7 +67,10 @@ def _validate_lengths(payload_length, name_length):
 def encoded_body_size(payload_length, name_length):
     _validate_lengths(payload_length, name_length)
     raw_length = name_length + payload_length + CRC.size
-    return BODY_SIZE * ((raw_length + BODY_DATA - 1) // BODY_DATA)
+    size = BODY_SIZE * ((raw_length + BODY_DATA - 1) // BODY_DATA)
+    if size >= 2**64:
+        raise ValueError("Encoded body exceeds wire-format length")
+    return size
 
 
 def encoded_size(payload_length, name_length):
@@ -75,20 +81,81 @@ def maximum_payload(capacity, name_length):
     _validate_lengths(0, name_length)
     if capacity < encoded_size(0, name_length):
         return -1
-    return min(MAX_PAYLOAD_BYTES,
-               ((capacity - HEADER_SIZE * HEADER_COPIES) // BODY_SIZE) * BODY_DATA - name_length - CRC.size)
+    return min((2**64 - 1) // BODY_SIZE,
+               (capacity - HEADER_SIZE * HEADER_COPIES) // BODY_SIZE) * BODY_DATA - name_length - CRC.size
 
 
-def pack_message(name, payload):
-    name_data = filename_bytes(name)
-    body_length = encoded_body_size(len(payload), len(name_data))
-    raw_header = BOOTSTRAP.pack(MAGIC, EMBEDDING_ID, ECC_PROFILE,
-                               INTERLEAVE_DEPTH, 0, len(payload), len(name_data),
-                               body_length, b'\0\0', 0)
-    raw_header = raw_header[:-CRC.size] + CRC.pack(zlib.crc32(raw_header[:-CRC.size]))
-    body = name_data + payload
-    body += CRC.pack(zlib.crc32(body))
-    return encode_header(raw_header) * HEADER_COPIES + encode_body(body)
+def _pack_header(payload_length, name_length):
+    body_length = encoded_body_size(payload_length, name_length)
+    raw = BOOTSTRAP.pack(MAGIC, EMBEDDING_ID, ECC_PROFILE,
+                         INTERLEAVE_DEPTH, 0, payload_length, name_length,
+                         body_length, b'\0\0', 0)
+    raw = raw[:-CRC.size] + CRC.pack(zlib.crc32(raw[:-CRC.size]))
+    return encode_header(raw) * HEADER_COPIES
+
+
+class MessageWriter:
+    """Sequential wire-byte source with bounded payload reads and RS groups.
+
+    The caller owns the source and keeps it unchanged through verification.
+    """
+    def __init__(self, name, source, payload_length):
+        self.name = filename_bytes(name)
+        self.source = source
+        self.payload_length = payload_length
+        self.length = encoded_size(payload_length, len(self.name))
+        self.origin = source.tell()
+        self._chunks = self._generate()
+        self.pending = b''
+
+    def __len__(self):
+        return self.length
+
+    def rewind(self):
+        self.source.seek(self.origin)
+        self.pending = b''
+        self._chunks = self._generate()
+
+    def _generate(self):
+        yield _pack_header(self.payload_length, len(self.name))
+        size = BODY_DATA * INTERLEAVE_DEPTH
+        pending = bytearray()
+        checksum = zlib.crc32(self.name)
+        for start in range(0, len(self.name), size):
+            pending.extend(self.name[start:start + size])
+            if len(pending) == size:
+                yield encode_body_group(pending)
+                pending.clear()
+        remaining = self.payload_length
+        while remaining:
+            chunk = self.source.read(min(size - len(pending), remaining))
+            if not chunk:
+                raise ValueError('Payload ended before its declared length')
+            remaining -= len(chunk)
+            checksum = zlib.crc32(chunk, checksum)
+            pending.extend(chunk)
+            if len(pending) == size:
+                yield encode_body_group(pending)
+                pending.clear()
+        if self.source.read(1):
+            raise ValueError('Payload exceeds its declared length')
+        pending.extend(CRC.pack(checksum))
+        for start in range(0, len(pending), size):
+            yield encode_body_group(pending[start:start + size])
+
+    def read(self, size):
+        if size < 0:
+            raise ValueError('A bounded read size is required')
+        result = bytearray()
+        while len(result) < size:
+            if not self.pending:
+                self.pending = next(self._chunks, b'')
+                if not self.pending:
+                    break
+            take = min(size - len(result), len(self.pending))
+            result.extend(self.pending[:take])
+            self.pending = self.pending[take:]
+        return bytes(result)
 
 
 def parse_header(data):
@@ -126,58 +193,97 @@ def parse_bootstrap(data):
     return replace(min(valid, key=lambda h: h.corrected_bytes), recovered_copies=len(valid))
 
 
-def unpack_body(header, encoded, confidence=None):
-    if len(encoded) != header.body_length:
-        raise ValueError('Truncated or oversized protected body')
-    raw, corrections, erasures = decode_body(encoded, confidence, return_erasures=True)
-    end = header.filename_length + header.payload_length
-    if any(raw[end + CRC.size:]):
-        raise ValueError('Nonzero Reed–Solomon data padding')
-    if zlib.crc32(raw[:end]) != CRC.unpack(raw[end:end + CRC.size])[0]:
-        raise ValueError('Filename/payload CRC32 mismatch after error correction')
-    name = raw[:header.filename_length].decode('utf-8')
-    filename_bytes(name)
-    return Recovery(name, raw[header.filename_length:end],
-                    header.corrected_bytes, corrections,
-                    header.recovered_copies, erasures)
-
-
 class MessageReader:
-    """Incremental NDV5 reader. All declared lengths are bounded."""
-    def __init__(self):
+    """Decode groups into a caller-owned binary sink.
+
+    Sink bytes are provisional until a Recovery is returned; discard on failure.
+    Recovery contains metadata and aggregate repair counts, never payload bytes.
+    """
+    def __init__(self, sink):
         self.bootstrap_size = HEADER_SIZE * HEADER_COPIES
         self.frames = 0
         self.received = bytearray()
         self.confidence = None
         self.header = None
         self.result = None
+        self.bytes_received = 0
+        self.body_received = 0
+        self.raw_received = 0
+        self.sink = sink
+        self.name = bytearray()
+        self.checksum_bytes = bytearray()
+        self.checksum = 0
+        self.correction_total = self.correction_max = 0
+        self.erasure_total = self.erasure_words = 0
+
+    def _consume(self, raw):
+        start = self.raw_received
+        name_end = self.header.filename_length
+        payload_end = name_end + self.header.payload_length
+        self.name.extend(raw[:max(0, name_end - start)])
+        payload = raw[max(0, name_end - start):max(0, payload_end - start)]
+        if payload and self.sink.write(payload) != len(payload):
+            raise OSError('Short payload write')
+        self.checksum = zlib.crc32(raw[:max(0, payload_end - start)], self.checksum)
+        self.checksum_bytes.extend(raw[max(0, payload_end - start):max(0, payload_end + CRC.size - start)])
+        if any(raw[max(0, payload_end + CRC.size - start):]):
+            raise ValueError('Nonzero Reed–Solomon data padding')
+        self.raw_received += len(raw)
 
     def feed(self, data, final=False, *, confidence=None):
         if self.result is not None:
             return self.result
         if confidence is not None:
-            confidence = array('d', confidence)
             if (len(confidence) != len(data)
                     or any(not math.isfinite(c) or c < 0 for c in confidence)):
                 raise ValueError('Invalid extracted byte confidence')
-            if self.confidence is None:
+        offset = 0
+        while offset < len(data):
+            target = (self.bootstrap_size if self.header is None else
+                      min(BODY_SIZE * INTERLEAVE_DEPTH,
+                          self.header.body_length - self.body_received))
+            take = min(target - len(self.received), len(data) - offset)
+            if confidence is not None and self.confidence is None:
                 self.confidence = array('d', [float('nan')]) * len(self.received)
-        if self.confidence is not None:
-            self.confidence.extend(confidence if confidence is not None
-                                   else array('d', [float('nan')]) * len(data))
-        self.received.extend(data)
-        if self.header is None:
-            if len(self.received) < self.bootstrap_size and not final:
-                return None
-            self.header = parse_bootstrap(bytes(self.received[:self.bootstrap_size]))
-        if len(self.received) >= self.header.total_length:
-            scores = None
+            self.received.extend(data[offset:offset + take])
             if self.confidence is not None:
-                scores = self.confidence[self.bootstrap_size:self.header.total_length]
-                if any(not math.isfinite(c) for c in scores):
-                    scores = None  # Byte-only callers retain hard-decision behavior.
-            self.result = unpack_body(
-                self.header, bytes(self.received[self.bootstrap_size:self.header.total_length]), scores)
+                self.confidence.extend(confidence[offset:offset + take] if confidence is not None
+                                       else [float('nan')] * take)
+            offset += take
+            self.bytes_received += take
+            if len(self.received) < target:
+                break
+            if self.header is None:
+                self.header = parse_bootstrap(bytes(self.received))
+            else:
+                scores = (self.confidence if self.confidence is not None
+                          and all(math.isfinite(c) for c in self.confidence) else None)
+                raw, corrections, erasures = decode_body_group(
+                    bytes(self.received), scores,
+                    word_offset=self.body_received // BODY_SIZE)
+                self._consume(raw)
+                self.body_received += target
+                self.correction_total += sum(corrections)
+                self.correction_max = max(self.correction_max, max(corrections))
+                self.erasure_total += sum(erasures)
+                self.erasure_words += sum(n > 0 for n in erasures)
+            self.received.clear()
+            self.confidence = None
+            if self.header is not None and self.body_received == self.header.body_length:
+                if self.checksum != CRC.unpack(self.checksum_bytes)[0]:
+                    raise ValueError('Filename/payload CRC32 mismatch after error correction')
+                name = self.name.decode('utf-8')
+                filename_bytes(name)
+                self.result = Recovery(
+                    filename=name,
+                    payload_length=self.header.payload_length,
+                    header_corrections=self.header.corrected_bytes,
+                    header_copies_recovered=self.header.recovered_copies,
+                    body_correction_total=self.correction_total,
+                    body_correction_max=self.correction_max,
+                    body_erasure_total=self.erasure_total,
+                    body_erasure_words=self.erasure_words)
+                break
         if final and self.result is None:
             raise ValueError('Video ended before a complete payload was recovered')
         return self.result

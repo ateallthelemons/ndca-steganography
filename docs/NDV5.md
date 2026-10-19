@@ -94,8 +94,18 @@ Each 96-byte copy is one protected bootstrap. RS-decode this block
 
 Python struct: `>4sBBBBQHQ2sI`. Validate the header CRC, identifiers, flags,
 reserved bytes, length bounds, and derived body size before consuming the body.
-No length field is used to preallocate an output buffer. The 256 MiB payload
-limit reflects the current buffering design.
+No length field is used to preallocate an output buffer. Encoding and decoding
+stream groups of at most eight RS words (160 raw / 480 encoded bytes). The final
+group may be shorter. CRC32 is updated incrementally, and decoded CLI output
+is published atomically from a temporary file only after CRC and padding checks
+pass. Confidence scores are retained only for the current group. The former
+256 MiB implementation limit is removed; both wire lengths must fit unsigned
+64-bit fields. `MessageWriter` reads from a caller-owned binary source;
+`MessageReader(sink)` requires a binary destination. `recover(..., sink=...)`
+requires a seekable destination so a confidence retry can reset provisional
+output. Recovery returns metadata and aggregate repair statistics, not payload
+bytes or per-codeword histories. The former whole-message Python APIs are
+removed; the NDV5 wire format is unchanged.
 
 ## Body
 
